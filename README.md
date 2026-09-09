@@ -10,7 +10,8 @@
 | Step 1 | Sistem mühitinin inisializasiyası, avadanlıq analizi, mərkəzi konfiqurasiya | ✅ hazır |
 | Step 2 | Video analizi, audio çıxarılması, kadrlara bölünmə | ✅ hazır |
 | Step 3 | RIFE interpolasiyası (→1000 FPS, 2^N + resample) | ✅ hazır |
-| Step 4 | Super-rezolusiya (→8K, Real-ESRGAN, tiled) | ⏳ növbəti |
+| Step 4 | Real-ESRGAN 8K upscale (tiled, async I/O) | ✅ hazır |
+| Step 5 | Kadrların birləşdirilməsi və video eksportu | ⏳ növbəti |
 | Step 4 | Super-rezolusiya (→8K, tiled inference) | ⬜ |
 | Step 5 | Denoise / deblur / rəng bərpası | ⬜ |
 | Step 6 | Kadrların keyfiyyət yoxlaması və filtrasiyası | ⬜ |
@@ -231,6 +232,57 @@ print(result.exp, result.target_count)  # məs: 6 2000
 print(result.out_dir)                   # Step 4-ün giriş qovluğu
 ```
 
+## Step 4 — Real-ESRGAN 8K Upscale
+
+Step 3-ün 720p/1000 FPS kadrlarını **8K UHD (7680×4320)**-ə qaldırır:
+
+1. **Model** — rəsmi RRDBNet x4 arxitekturası vendor olunub
+   (`pipeline/esrgan/vendor/`, BasicSR Apache-2.0 + Real-ESRGAN BSD-3);
+   çəkilər rəsmi GitHub release-dən avtomatik endirilir
+   (`--esrgan-model x4plus` ümumi video, `x4plus-anime` animasiya, əl ilə
+   `--esrgan-weights fayl.pth`). İnferens `eval()` + `no_grad()` + CUDA fp16.
+2. **Ölçü riyaziyyatı** — x4 neyron upscale (5120×2880) + dəqiq Lanczos resize
+   ilə tam hədəf ölçü (rəsmi `outscale` proseduru).
+3. **Tiling** — rəsmi halo-kəsmə alqoritmi (`tile_pad=10`), tile ölçüsü
+   default olaraq Step 1-in VRAM-dəyərindən (`--upscale-tile`, `0` = söndür);
+   OOM halında tile avtomatik yarıya bölünüb təkrar cəhd olunur.
+4. **Async I/O** — 8K fayllar fon-yazıcı thread-də yazılır (GPU gözləmir),
+   sıra qorunur, yazı xətası ucadan bildirilir.
+5. **Yaddaş + progress** — hər 10 kadrdan bir `empty_cache()`, sonda `unload()`
+   (VRAM Step 5-ə boşalır); `tqdm` ilə kadr/san göstərilir.
+
+```bash
+# Tam zəncir 1→4 (GPU + torch tələb edir):
+python main.py --input video/in.mp4 --output video/out.mp4 --to-step 4
+
+# Yalnız Step 4 (saxlanmış konfiqdən):
+python main.py --config workspace/config.json --from-step 4 --to-step 4
+
+# CPU-da / torch-suz smoke test (QEYD: real AI deyil, adi Lanczos!):
+python main.py --input video/in.mp4 --output video/out.mp4 --to-step 4 \
+  --backend blend --upscale-backend resize --output-format jpg --upscale-format jpg
+
+# Köməkçi seçimlər:
+python main.py --to-step 4 ... --esrgan-model x4plus-anime \
+  --upscale-tile 512 --tile-pad 16 --writer-queue 4 --upscale-cache-every 5
+```
+
+Nəticə: `upscaled_8k/frame_8k_%08d.png` + yenilənmiş `config.json`
+(`esrgan_model`, `upscaled_frame_count`, ...).
+
+### Proqramlı istifadə (Step 4)
+
+```python
+from pipeline.config import PipelineConfig
+from pipeline.step04_upscale import Step04Upscale
+
+config = PipelineConfig.load("workspace/config.json")
+result = Step04Upscale(backend="esrgan", model="x4plus").run(config)
+
+print(result.written_count, result.target_size)  # məs: 2000 (7680, 4320)
+print(result.out_dir)                            # Step 5-in giriş qovluğu
+```
+
 ### Layihə strukturu
 
 ```text
@@ -246,15 +298,24 @@ print(result.out_dir)                   # Step 4-ün giriş qovluğu
 │   ├── step01_environment.py    # STEP 1: mühit + GPU + konfiqurasiya
 │   ├── step02_frames.py         # STEP 2: analiz + audio + kadr çıxarılması
 │   ├── step03_interpolate.py    # STEP 3: 2^N subdivision + resample orkestri
-│   └── rife/
-│       ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
-│       ├── weights.py           # çəki həlli + Drive auto-yükləmə
-│       ├── io.py                # kadr oxuma/yazma (OpenCV)
-│       └── vendor/              # rəsmi RIFE v4 kodu (MIT) + VENDOR.md
+│   ├── step04_upscale.py        # STEP 4: 8K upscale orkestri (async yazı ilə)
+│   ├── frame_io.py              # paylaşılan kadr oxuma/yazma (OpenCV)
+│   ├── rife/
+│   │   ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
+│   │   ├── weights.py           # çəki həlli + Drive auto-yükləmə
+│   │   ├── io.py                # geriyə-uyğun shim (frame_io-ya)
+│   │   └── vendor/              # rəsmi RIFE v4 kodu (MIT) + VENDOR.md
+│   └── esrgan/
+│       ├── backends.py          # esrgan (PyTorch AI) / resize (smoke)
+│       ├── tiling.py            # torch-suz tile həndəsəsi (rəsmi riyaziyyat)
+│       ├── weights.py           # çəki həlli + GitHub auto-yükləmə
+│       ├── writer.py            # fon-thread async yazıcı
+│       └── vendor/              # rəsmi RRDBNet (Apache-2.0/BSD-3) + sənəd
 └── tests/
     ├── test_step01_environment.py
     ├── test_step02_frames.py
-    └── test_step03_interpolate.py
+    ├── test_step03_interpolate.py
+    └── test_step04_upscale.py
 ```
 
 ### Testlər

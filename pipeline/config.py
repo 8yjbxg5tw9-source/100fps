@@ -34,6 +34,7 @@ CONFIG_FILENAME = "config.json"         # Step N -> Step N+1 handoff file
 FRAME_PATTERN_PNG = "frame_%06d.png"    # lossless frames (default)
 FRAME_PATTERN_JPG = "frame_%06d.jpg"    # high-quality lossy alternative
 INTERPOLATED_FRAME_PATTERN = "frame_%08d.png"  # Step 3 output (8 digits: 1000fps!)
+UPSCALED_FRAME_PATTERN = "frame_8k_%08d.png"     # Step 4 output (8K frames)
 
 
 @dataclass
@@ -82,6 +83,13 @@ class PipelineConfig:
     interpolation_exp: Optional[int] = None      # N in the 2^N dense pass
     interpolated_frame_count: Optional[int] = None  # exact 1000fps frames
     interpolation_backend: Optional[str] = None  # "rife" | "blend"
+
+    # -- Super-resolution (filled in by Step 4) ------------------------------
+    esrgan_model: Optional[str] = None            # "x4plus" | "x4plus-anime"
+    esrgan_backend: Optional[str] = None          # "esrgan" | "resize"
+    esrgan_tile: Optional[int] = None             # tile actually used (0 = off)
+    upscaled_frame_count: Optional[int] = None    # 8K frames written
+    upscaled_frame_pattern: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Accept plain strings for convenience.
@@ -226,5 +234,12 @@ class PipelineConfig:
                     if self.interpolated_frame_count is not None
                     else "not interpolated yet"
                 )
+            )
+        # Step 4 section (only once Step 4 has run).
+        if self.upscaled_frame_count is not None:
+            lines.append(
+                f"  upscale (Step 4)   : {self.esrgan_model} via {self.esrgan_backend}, "
+                f"tile={self.esrgan_tile}, "
+                f"{self.upscaled_frame_count} frames ({self.upscaled_frame_pattern})"
             )
         return "\n".join(lines)

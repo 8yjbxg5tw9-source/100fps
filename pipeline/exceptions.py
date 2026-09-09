@@ -52,3 +52,15 @@ class RifeWeightsError(PipelineError):
 
 class RifeInferenceError(PipelineError):
     """Raised when the interpolation backend fails (no torch/CUDA, OOM, ...)."""
+
+
+class UpscaleError(PipelineError):
+    """Raised when Step 4 cannot upscale (no input frames, bad target, ...)."""
+
+
+class EsrganWeightsError(PipelineError):
+    """Raised when Real-ESRGAN weights are missing, invalid or not downloadable."""
+
+
+class EsrganInferenceError(PipelineError):
+    """Raised when the upscaling backend fails (no torch/CUDA, OOM, ...)."""
