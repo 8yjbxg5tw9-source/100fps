@@ -9,7 +9,8 @@
 |-------|-----|--------|
 | Step 1 | Sistem mühitinin inisializasiyası, avadanlıq analizi, mərkəzi konfiqurasiya | ✅ hazır |
 | Step 2 | Video analizi, audio çıxarılması, kadrlara bölünmə | ✅ hazır |
-| Step 3 | Optik axın / kadr interpolasiyası (→1000 FPS, RIFE) | ⏳ növbəti |
+| Step 3 | RIFE interpolasiyası (→1000 FPS, 2^N + resample) | ✅ hazır |
+| Step 4 | Super-rezolusiya (→8K, Real-ESRGAN, tiled) | ⏳ növbəti |
 | Step 4 | Super-rezolusiya (→8K, tiled inference) | ⬜ |
 | Step 5 | Denoise / deblur / rəng bərpası | ⬜ |
 | Step 6 | Kadrların keyfiyyət yoxlaması və filtrasiyası | ⬜ |
@@ -175,11 +176,66 @@ print(result.frame_dir)             # Step 3-ün giriş qovluğu
 print(result.audio_path)            # Step 8-in istifadə edəcəyi səs (və ya None)
 ```
 
+## Step 3 — RIFE İnterpolasiyası (→1000 FPS)
+
+Step 2-nin 720p kadrlarını rəsmi **RIFE v4** şəbəkəsi ilə 1000 FPS-ə çatdırır:
+
+1. **Model** — rəsmi ECCV2022-RIFE kodu repo-da vendor olunub
+   (`pipeline/rife/vendor/`, MIT, yalnız import sətirləri patch olunub);
+   çəkilər ilk işə düşmədə Google Drive-dan avtomatik endirilir
+   (`weights/rife/`, `--rife-version 4|4.6|hd`, əl ilə `--weights fayl.pkl`).
+   İnferens `eval()` + `torch.no_grad()` + CUDA fp16 ilə, 32px padding
+   (rəsmi formula) və OOM halında batch-yarıya-bölmə ilə işləyir.
+2. **Multi-pass** — `N = ceil(log2(faktor))` rekursiv midpoint-subdivision
+   (30→1000 üçün 33.33x → `N=6` → 64x dense), hər səviyyənin midpoint-ləri
+   `batch_size` ilə GPU-ya göndərilir.
+3. **Dəqiq 1000 FPS** — dense axın (`(P-1)·2^N+1`) axınlı (streaming)
+   resample ilə tam `round(müddət·1000)` kadra endirilir — yaddaşda yalnız
+   bir cüt saxlanılır.
+4. **Sürət kəsələri** — statik cütlər (inference-siz kopiya) və səhnə
+   kəsimləri (ghosting-ə qarşı kopiya) avtomatik tutulur (`--no-shortcuts`
+   ilə söndürülür).
+5. **Yaddaş** — hər 10 cütdən bir `torch.cuda.empty_cache()`, sonda backend
+   `unload()` olunur (VRAM Step 4-ə boş qalır); gedişat `tqdm` ilə
+   (yazılan/hədəf) göstərilir.
+
+```bash
+# Tam zəncir: Step 1 + 2 + 3 (GPU + torch tələb edir):
+python main.py --input video/in.mp4 --output video/out.mp4 --to-step 3
+
+# Yalnız Step 3 (saxlanmış konfiqdən):
+python main.py --config workspace/config.json --from-step 3 --to-step 3
+
+# CPU-da / torch-suz smoke test (QEYD: real AI deyil, adi blend!):
+python main.py --input video/in.mp4 --output video/out.mp4 --to-step 3 \
+  --backend blend --output-format jpg
+
+# Köməkçi seçimlər:
+python main.py --to-step 3 ... --batch-size 2 --rife-version 4.6 \
+  --weights ./train_log --device cuda --max-exp 6 --fp32 --no-shortcuts
+```
+
+Nəticə: `interpolated_720p/frame_%08d.png` (8 rəqəm — 1000 FPS!) + yenilənmiş
+`config.json` (`interpolation_exp`, `interpolated_frame_count`).
+
+### Proqramlı istifadə (Step 3)
+
+```python
+from pipeline.config import PipelineConfig
+from pipeline.step03_interpolate import Step03Interpolate
+
+config = PipelineConfig.load("workspace/config.json")
+result = Step03Interpolate(backend="rife", batch_size=4).run(config)
+
+print(result.exp, result.target_count)  # məs: 6 2000
+print(result.out_dir)                   # Step 4-ün giriş qovluğu
+```
+
 ### Layihə strukturu
 
 ```text
 100fps/
-├── main.py                      # CLI giriş nöqtəsi (Step 1 + Step 2)
+├── main.py                      # CLI giriş nöqtəsi (--from-step/--to-step)
 ├── requirements.txt             # Python asılılıqları
 ├── pipeline/
 │   ├── __init__.py
@@ -188,10 +244,17 @@ print(result.audio_path)            # Step 8-in istifadə edəcəyi səs (və ya
 │   ├── logger.py                # Vaxt damğalı terminal logları
 │   ├── exceptions.py            # Xüsusi xəta tipləri
 │   ├── step01_environment.py    # STEP 1: mühit + GPU + konfiqurasiya
-│   └── step02_frames.py         # STEP 2: analiz + audio + kadr çıxarılması
+│   ├── step02_frames.py         # STEP 2: analiz + audio + kadr çıxarılması
+│   ├── step03_interpolate.py    # STEP 3: 2^N subdivision + resample orkestri
+│   └── rife/
+│       ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
+│       ├── weights.py           # çəki həlli + Drive auto-yükləmə
+│       ├── io.py                # kadr oxuma/yazma (OpenCV)
+│       └── vendor/              # rəsmi RIFE v4 kodu (MIT) + VENDOR.md
 └── tests/
     ├── test_step01_environment.py
-    └── test_step02_frames.py
+    ├── test_step02_frames.py
+    └── test_step03_interpolate.py
 ```
 
 ### Testlər

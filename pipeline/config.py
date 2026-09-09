@@ -33,6 +33,7 @@ AUDIO_FILENAME_AAC = "input_audio.aac"  # lossy fallback / explicit choice
 CONFIG_FILENAME = "config.json"         # Step N -> Step N+1 handoff file
 FRAME_PATTERN_PNG = "frame_%06d.png"    # lossless frames (default)
 FRAME_PATTERN_JPG = "frame_%06d.jpg"    # high-quality lossy alternative
+INTERPOLATED_FRAME_PATTERN = "frame_%08d.png"  # Step 3 output (8 digits: 1000fps!)
 
 
 @dataclass
@@ -76,6 +77,11 @@ class PipelineConfig:
     frame_pattern: Optional[str] = None
     # Full probe dump (ffprobe/OpenCV) for Step 3+ debugging.
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # -- Interpolation (filled in by Step 3) ---------------------------------
+    interpolation_exp: Optional[int] = None      # N in the 2^N dense pass
+    interpolated_frame_count: Optional[int] = None  # exact 1000fps frames
+    interpolation_backend: Optional[str] = None  # "rife" | "blend"
 
     def __post_init__(self) -> None:
         # Accept plain strings for convenience.
@@ -208,6 +214,17 @@ class PipelineConfig:
                     f"{self.extracted_frame_count} files ({self.frame_pattern})"
                     if self.extracted_frame_count is not None
                     else "not extracted yet"
+                )
+            )
+        # Step 3 section (only once Step 3 has run).
+        if self.interpolation_exp is not None:
+            lines.append(
+                f"  interp (Step 3)  : exp={self.interpolation_exp} "
+                f"(2^{self.interpolation_exp}x dense), backend={self.interpolation_backend}, "
+                + (
+                    f"{self.interpolated_frame_count} frames @ {self.target_fps} FPS"
+                    if self.interpolated_frame_count is not None
+                    else "not interpolated yet"
                 )
             )
         return "\n".join(lines)

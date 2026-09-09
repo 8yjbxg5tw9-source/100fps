@@ -1,5 +1,7 @@
 # Local working data (raw/interpolated/upscaled frames are huge -- never commit)
 workspace/
+# Downloaded RIFE weights (40-170 MB .pkl files -- never commit)
+weights/
 *.mp4
 *.mkv
 *.mov

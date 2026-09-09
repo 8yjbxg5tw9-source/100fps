@@ -40,3 +40,15 @@ class FrameExtractionError(PipelineError):
     Unlike audio extraction (auxiliary -- Step 8 merges audio only if the
     file exists), frames are mandatory for Step 3, so any failure aborts.
     """
+
+
+class InterpolationError(PipelineError):
+    """Raised when Step 3 cannot interpolate (too few frames, exp overflow)."""
+
+
+class RifeWeightsError(PipelineError):
+    """Raised when RIFE weights are missing, invalid or not downloadable."""
+
+
+class RifeInferenceError(PipelineError):
+    """Raised when the interpolation backend fails (no torch/CUDA, OOM, ...)."""
