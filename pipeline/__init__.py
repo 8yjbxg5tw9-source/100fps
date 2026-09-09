@@ -5,10 +5,17 @@ analysis, central configuration) is the entry point; Step 2 (analysis, audio
 and frame extraction) consumes the config; Step 3 (RIFE interpolation to
 1000 FPS) consumes the raw frames; Step 4 (Real-ESRGAN 8K upscale) consumes
 the interpolated frames; Step 5 (FFmpeg assembly + verification) produces the
-final video; Step 6 (safe cleanup) reclaims workspace disk space; later steps
-build on all of them.
+final video; Step 6 (safe cleanup) reclaims workspace disk space; Step 7
+(checkpoint & resume) makes every run crash-proof; later steps build on all
+of them.
 """
 
+from pipeline.checkpoint import (
+    CheckpointManager,
+    PipelineState,
+    ResumeDecision,
+    StepProgress,
+)
 from pipeline.config import PipelineConfig
 from pipeline.step01_environment import Step01Environment, setup_environment
 from pipeline.step02_frames import Step02Frames, Step02Result, VideoMetadata
@@ -17,13 +24,17 @@ from pipeline.step04_upscale import Step04Upscale, Step04Result
 from pipeline.step05_assemble import Step05Assemble, Step05Result
 from pipeline.step06_cleanup import Step06Cleanup, Step06Result
 
-__version__ = "0.6.0"  # Steps 1-6 complete
+__version__ = "0.7.0"  # Steps 1-7 complete
 __all__ = [
+    "CheckpointManager",
     "PipelineConfig",
+    "PipelineState",
+    "ResumeDecision",
     "Step01Environment",
     "setup_environment",
     "Step02Frames",
     "Step02Result",
+    "StepProgress",
     "VideoMetadata",
     "Step03Interpolate",
     "Step03Result",

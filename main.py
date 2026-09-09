@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
+from pipeline.checkpoint import CheckpointManager, steps_to_run
 from pipeline.config import TARGET_FPS, TARGET_HEIGHT, TARGET_WIDTH, PipelineConfig
 from pipeline.exceptions import (
     FFmpegNotFoundError,
@@ -221,6 +223,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-audio", action="store_true",
         help="Step 6: keep the extracted audio file.",
     )
+    # Step 7 options (checkpoint & resume).
+    parser.add_argument(
+        "--resume", choices=["ask", "yes", "no"], default="ask",
+        help="Unfinished run found: 'ask' prompts (auto-resumes when "
+        "non-interactive), 'yes' always resumes, 'no' discards progress.",
+    )
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=10,
+        help="Record pipeline_state.json every N pairs/frames (default: 10).",
+    )
+    parser.add_argument(
+        "--no-checkpoint", action="store_true",
+        help="Disable Step 7 checkpoint tracking entirely.",
+    )
     return parser
 
 
@@ -232,41 +248,123 @@ def main(argv: list[str] | None = None) -> int:
         log.error("--from-step (%d) > --to-step (%d).", args.from_step, args.to_step)
         return 2
     try:
+        use_checkpoint = not args.no_checkpoint
+        manager: CheckpointManager | None = None
+        decision = None  # ResumeDecision when checkpointing is on
+        skip_through = 0  # completed steps to skip (full-run resume only)
+
+        def _tracked(step_num: int, run_step):  # noqa: ANN001, ANN202 - tiny local helper
+            run_step()
+            if manager is not None:
+                manager.mark_step_complete(step_num)
+                manager.refresh_snapshot(config)
+
         if args.from_step > 1:
             if not args.config:
                 log.error("--from-step %d requires --config <saved config.json>.", args.from_step)
                 return 2
             config = PipelineConfig.load(args.config)
             log.info("Resuming from saved config: %s", args.config)
+            if use_checkpoint:
+                # Explicit step ranges always run as asked; the checkpoint
+                # only tracks progress (no step-skipping here).
+                manager = CheckpointManager(config.workspace_root, logger=log)
+                snapshot = manager.snapshot_from_config(config)
+                decision = manager.decide(snapshot, policy=args.resume)
+                log.info("Checkpoint: %s.", decision.reason)
+                if decision.action == "overwrite":
+                    manager.discard_progress(from_step=args.from_step)
+                    manager.begin_run(snapshot, args.from_step)
+                elif decision.action == "resume":
+                    manager.attach(decision.state)
+                else:
+                    manager.begin_run(snapshot, args.from_step)
         else:
             if not args.input or not args.output:
                 log.error("--input and --output are required (or use --config to resume).")
                 return 2
-            config = setup_environment(
-                input_video_path=args.input,
-                final_output_path=args.output,
-                workspace_root=args.workspace,
-                target_fps=args.target_fps,
-                target_width=args.target_width,
-                target_height=args.target_height,
-                auto_install=not args.no_auto_install,
-                tile_size_override=args.tile_size,
-                save_config=not args.no_save_config,
-                logger=log,
-            )
-            if args.to_step < 2:
-                return 0
+            if use_checkpoint:
+                manager = CheckpointManager(Path(args.workspace), logger=log)
+                desired = manager.snapshot_from_values(
+                    args.input, args.output,
+                    args.target_fps, args.target_width, args.target_height,
+                )
+                decision = manager.decide(desired, policy=args.resume)
+                log.info("Checkpoint: %s.", decision.reason)
+                if decision.action == "overwrite":
+                    manager.discard_progress(from_step=1)
+            saved_config = Path(args.workspace) / "config.json"
+            if (
+                use_checkpoint
+                and decision.action == "resume"
+                and saved_config.is_file()
+            ):
+                # Resume WITHOUT re-probing: keeps Step 2 metadata intact.
+                config = PipelineConfig.load(saved_config)
+                manager.attach(decision.state)
+                skip_through = decision.skip_through_step
+                log.info("Resuming run from saved config: %s", saved_config)
+            else:
+                config = setup_environment(
+                    input_video_path=args.input,
+                    final_output_path=args.output,
+                    workspace_root=args.workspace,
+                    target_fps=args.target_fps,
+                    target_width=args.target_width,
+                    target_height=args.target_height,
+                    auto_install=not args.no_auto_install,
+                    tile_size_override=args.tile_size,
+                    save_config=not args.no_save_config,
+                    logger=log,
+                )
+                if use_checkpoint:
+                    if decision.action == "resume":
+                        # config.json was lost; the state file backs up Step 2
+                        # probe results — restore them so frame loops can run.
+                        manager.attach(decision.state)
+                        restored = manager.restore_metadata(config, decision.state)
+                        config.save(saved_config)
+                        skip_through = decision.skip_through_step
+                        log.info(
+                            "Restored %d metadata field(s) from the checkpoint: %s.",
+                            len(restored), ", ".join(restored) or "none",
+                        )
+                    else:
+                        manager.begin_run(
+                            manager.snapshot_from_config(config), args.from_step
+                        )
+                if args.to_step < 2:
+                    if manager is not None:
+                        manager.mark_step_complete(1)
+                        manager.refresh_snapshot(config)
+                    return 0
 
-        if args.from_step <= 2 <= args.to_step:
-            Step02Frames(
+        planned = (
+            steps_to_run(args.from_step, args.to_step, skip_through)
+            if use_checkpoint and args.from_step == 1
+            else list(range(args.from_step, args.to_step + 1))
+        )
+        if use_checkpoint and args.from_step == 1 and skip_through:
+            skipped = [n for n in range(args.from_step, args.to_step + 1) if n <= skip_through]
+            if skipped:
+                log.info(
+                    "Skipping already-completed step(s) %s (per pipeline_state.json).",
+                    skipped,
+                )
+        if not planned:
+            log.info("All requested steps are already complete — nothing to do.")
+            return 0
+
+        if 2 in planned:
+            _tracked(2, lambda: Step02Frames(
                 image_format=args.image_format,
                 audio_format=args.audio_format,
                 clean_frame_dir=not args.keep_old_frames,
                 logger=log,
-            ).run(config)
+            ).run(config))
 
-        if args.from_step <= 3 <= args.to_step:
-            Step03Interpolate(
+        if 3 in planned:
+            _tracked(3, lambda: Step03Interpolate(
                 backend=args.backend,
                 rife_version=args.rife_version,
                 weights=args.weights,
@@ -279,10 +377,12 @@ def main(argv: list[str] | None = None) -> int:
                 static_threshold=None if args.no_shortcuts else 1.0,
                 cut_threshold=None if args.no_shortcuts else 60.0,
                 logger=log,
-            ).run(config)
+                checkpoint=manager,
+                checkpoint_every=args.checkpoint_every,
+            ).run(config))
 
-        if args.from_step <= 4 <= args.to_step:
-            Step04Upscale(
+        if 4 in planned:
+            _tracked(4, lambda: Step04Upscale(
                 backend=args.upscale_backend,
                 model=args.esrgan_model,
                 weights=args.esrgan_weights,
@@ -295,27 +395,29 @@ def main(argv: list[str] | None = None) -> int:
                 empty_cache_every=args.upscale_cache_every,
                 writer_queue=args.writer_queue,
                 logger=log,
-            ).run(config)
+                checkpoint=manager,
+                checkpoint_every=args.checkpoint_every,
+            ).run(config))
 
-        if args.from_step <= 5 <= args.to_step:
-            Step05Assemble(
+        if 5 in planned:
+            _tracked(5, lambda: Step05Assemble(
                 video_codec=args.video_codec,
                 crf=args.crf,
                 encoder_preset=args.encoder_preset,
                 ffmpeg_args=args.ffmpeg_args,
                 verify=not args.skip_verify,
                 logger=log,
-            ).run(config)
+            ).run(config))
 
-        if args.from_step <= 6 <= args.to_step:
-            Step06Cleanup(
+        if 6 in planned:
+            _tracked(6, lambda: Step06Cleanup(
                 dry_run=args.dry_run,
                 keep_raw=args.keep_raw,
                 keep_interpolated=args.keep_interpolated,
                 keep_upscaled=args.keep_upscaled,
                 keep_audio=args.keep_audio,
                 logger=log,
-            ).run(config)
+            ).run(config))
     except InputVideoNotFoundError as exc:
         log.error("%s", exc)
         return 1

@@ -40,9 +40,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from pipeline.base import PipelineStep
+from pipeline.checkpoint import (
+    continuous_prefix_length,
+    is_oom_error,
+    scan_frame_indices,
+)
 from pipeline.config import (
     CONFIG_FILENAME,
     UPSCALED_FRAME_PATTERN,
@@ -50,6 +55,9 @@ from pipeline.config import (
 )
 from pipeline.exceptions import UpscaleError
 from pipeline.logger import get_logger
+
+if TYPE_CHECKING:
+    from pipeline.checkpoint import CheckpointManager
 
 
 @dataclass
@@ -88,11 +96,20 @@ class Step04Upscale(PipelineStep[Step04Result]):
         backend_obj: Optional[Any] = None,  # injected backend (tests/users)
         frame_io: Optional[Any] = None,     # injected FrameIO (tests)
         logger: Optional[logging.Logger] = None,
+        resume: bool = True,             # Step 7: skip on-disk 8K frames
+        checkpoint: Optional["CheckpointManager"] = None,  # Step 7: progress recorder
+        checkpoint_every: int = 10,      # record state every N frames
+        oom_retry: bool = True,          # Step 7: halve tile + retry same frame on OOM
+        min_tile: int = 64,              # floor for OOM-driven tile halving
     ) -> None:
         if output_format not in ("png", "jpg"):
             raise ValueError(f"output_format must be 'png' or 'jpg', got {output_format!r}")
         if tile is not None and tile < 0:
             raise ValueError(f"tile must be >= 0, got {tile}.")
+        if checkpoint_every < 1:
+            raise ValueError(f"checkpoint_every must be >= 1, got {checkpoint_every}")
+        if min_tile < 1:
+            raise ValueError(f"min_tile must be >= 1, got {min_tile}.")
         self.backend_name = backend
         self.model_name = model
         self.weights = weights
@@ -109,6 +126,11 @@ class Step04Upscale(PipelineStep[Step04Result]):
         self._backend = backend_obj
         self._frame_io = frame_io
         self.log = logger or get_logger(__name__)
+        self.resume = resume
+        self.checkpoint = checkpoint
+        self.checkpoint_every = checkpoint_every
+        self.oom_retry = oom_retry
+        self.min_tile = min_tile
 
     # -- Orchestration -----------------------------------------------------------
     def run(self, config: PipelineConfig) -> Step04Result:
@@ -131,36 +153,67 @@ class Step04Upscale(PipelineStep[Step04Result]):
 
         frame_io = self._resolve_frame_io()
         backend = self._resolve_backend(tile, target)
-        backend.load()
 
         out_dir = config.upscaled_8k
         out_dir.mkdir(parents=True, exist_ok=True)
-        if self.clean_output_dir:
-            self._clean_output_dir(out_dir)
         pattern = UPSCALED_FRAME_PATTERN.replace(".png", f".{self.output_format}")
+        ckpt_params = {
+            "source_count": len(sources),
+            "target_size": list(target),
+            "pattern": pattern,
+        }
+        # Step 7: resume from on-disk frames BEFORE loading the model, so a
+        # fully-complete output dir skips GPU init entirely.
+        start_idx, complete, resumed = self._plan_resume(
+            out_dir, len(sources), ckpt_params
+        )
+        backend_name = getattr(backend, "name", self.backend_name)
+        if complete:
+            return self._finish_already_complete(
+                config, backend_name, out_dir, pattern, len(sources), tile, target
+            )
+        if resumed:
+            self.log.info(
+                "Resuming Step 4 from frame %d/%d — %d frame(s) already on "
+                "disk, no re-processing.",
+                start_idx, len(sources), start_idx - 1,
+            )
+        elif self.clean_output_dir:
+            self._clean_output_dir(out_dir)
+
+        backend.load()
 
         from pipeline.esrgan.writer import AsyncFrameWriter
 
-        bar = self._make_progress_bar(len(sources), desc="Upscaling")
+        bar = self._make_progress_bar(
+            len(sources), desc="Upscaling", initial=start_idx - 1
+        )
         try:
             with AsyncFrameWriter(frame_io, self.writer_queue, self.log) as writer:
                 with bar:
-                    for idx, src in enumerate(sources, start=1):
-                        frame = frame_io.read(src)
-                        upscaled = backend.upscale(frame)
+                    for idx in range(start_idx, len(sources) + 1):
+                        frame = frame_io.read(sources[idx - 1])
+                        upscaled = self._upscale_with_oom_retry(
+                            backend, frame, idx, ckpt_params, len(sources)
+                        )
                         writer.submit(out_dir / (pattern % idx), upscaled)
                         del frame, upscaled
                         if idx % max(1, self.empty_cache_every) == 0:
                             backend.empty_cache()
+                        if idx % max(1, self.checkpoint_every) == 0:
+                            self._record(ckpt_params, idx, len(sources))
                         bar.update(1)
                         bar.set_postfix_str(f"{idx}/{len(sources)}")
-            written = writer.count
+            written = (start_idx - 1) + writer.count
+            self._record(ckpt_params, written, len(sources))
         finally:
             backend.unload()  # release VRAM for Step 5 even on failure
 
+        # OOM retries may have shrunk the tile mid-run: report what's real.
+        tile = getattr(backend, "tile", tile)
         validation_ok = self._validate(written, len(sources))
         config.esrgan_model = self.model_name if self.backend_name == "esrgan" else None
-        config.esrgan_backend = backend.name
+        config.esrgan_backend = backend_name
         config.esrgan_tile = tile
         config.upscaled_frame_count = written
         config.upscaled_frame_pattern = pattern
@@ -178,10 +231,106 @@ class Step04Upscale(PipelineStep[Step04Result]):
             tile_used=tile,
             out_dir=out_dir,
             frame_pattern=pattern,
-            backend_name=backend.name,
+            backend_name=backend_name,
             model_name=config.esrgan_model,
             validation_ok=validation_ok,
         )
+
+    # -- Step 7: resume planning --------------------------------------------------------
+    def _plan_resume(
+        self, out_dir: Path, source_count: int, ckpt_params: dict
+    ) -> tuple:
+        """Returns ``(start_idx, complete, resumed)`` from on-disk 8K frames.
+
+        Output file N always corresponds to source N, so resume is a pure
+        index skip — except the last continuous file, which is reprocessed in
+        case a crash tore it mid-write.
+        """
+        if not self.resume:
+            return (1, False, False)
+        indices = scan_frame_indices(out_dir, "frame_8k_", f".{self.output_format}")
+        if not indices:
+            return (1, False, False)
+        on_disk = continuous_prefix_length(indices)
+        if on_disk == 0:
+            return (1, False, False)  # stray files only -> fresh+clean
+        if self.checkpoint is not None:
+            diffs = self.checkpoint.check_step_params(self.name, ckpt_params)
+            if diffs:
+                self.log.warning(
+                    "On-disk Step 4 frames are from different settings "
+                    "(%s) — discarding them and starting fresh.",
+                    "; ".join(diffs),
+                )
+                return (1, False, False)
+        if on_disk >= source_count:
+            return (1, True, True)
+        return (max(1, on_disk), False, True)
+
+    def _finish_already_complete(
+        self,
+        config: PipelineConfig,
+        backend_name: str,
+        out_dir: Path,
+        pattern: str,
+        source_count: int,
+        tile: int,
+        target: tuple,
+    ) -> Step04Result:
+        self.log.info(
+            "Step 4 outputs already complete: %d/%d frames on disk — "
+            "skipping inference entirely (no model loaded).",
+            source_count, source_count,
+        )
+        config.esrgan_model = self.model_name if self.backend_name == "esrgan" else None
+        config.esrgan_backend = backend_name
+        config.esrgan_tile = tile
+        config.upscaled_frame_count = source_count
+        config.upscaled_frame_pattern = pattern
+        saved = config.save(config.workspace_root / CONFIG_FILENAME)
+        self.log.info("Updated config saved for Step 5: %s", saved)
+        self.log.info("\n%s", config.summary())
+        return Step04Result(
+            source_frames=source_count,
+            written_count=source_count,
+            target_size=target,
+            tile_used=tile,
+            out_dir=out_dir,
+            frame_pattern=pattern,
+            backend_name=backend_name,
+            model_name=config.esrgan_model,
+            validation_ok=True,
+        )
+
+    def _record(self, params: dict, frame_idx: int, total: int) -> None:
+        if self.checkpoint is not None:
+            self.checkpoint.record_progress(self.name, frame_idx, total, params)
+
+    def _upscale_with_oom_retry(
+        self, backend: Any, frame: Any, idx: int, params: dict, total: int
+    ) -> Any:
+        """Upscale one frame, halving the tile and retrying on VRAM OOM."""
+        while True:
+            try:
+                return backend.upscale(frame)
+            except Exception as exc:  # noqa: BLE001 - OOM detected by inspection
+                if not self.oom_retry or not is_oom_error(exc):
+                    raise
+                current_tile = getattr(backend, "tile", None)
+                if current_tile is None or current_tile <= self.min_tile:
+                    raise
+                new_tile = max(self.min_tile, current_tile // 2)
+                # Persist the frontier BEFORE retrying; the failed frame is
+                # NOT marked done, so the retry (or a later resume after a
+                # real crash) restarts exactly from this frame.
+                self._record(params, idx - 1, total)
+                self.log.warning(
+                    "CUDA out of memory at frame %d — halved tile size "
+                    "%d → %d and retrying the same frame ...",
+                    idx, current_tile, new_tile,
+                )
+                backend.tile = new_tile
+                backend.empty_cache()
 
     # -- Setup helpers ------------------------------------------------------------------
     def _resolve_frame_io(self) -> Any:
@@ -254,13 +403,13 @@ class Step04Upscale(PipelineStep[Step04Result]):
         )
         return False
 
-    def _make_progress_bar(self, total: int, desc: str = "") -> Any:
+    def _make_progress_bar(self, total: int, desc: str = "", initial: int = 0) -> Any:
         try:
             from tqdm import tqdm
         except ImportError:
             self.log.warning("tqdm not installed -- progress bar disabled.")
             return _NullProgress()
-        return tqdm(total=total, desc=desc, unit="frame")
+        return tqdm(total=total, desc=desc, unit="frame", initial=initial)
 
 
 class _NullProgress:

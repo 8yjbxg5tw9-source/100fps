@@ -88,3 +88,12 @@ class CleanupError(PipelineError):
     Individual locked/unreadable files never raise -- they are collected in
     the result's ``failed`` list and reported as warnings instead.
     """
+
+
+class CheckpointError(PipelineError):
+    """Raised when Step 7 checkpointing fails (corrupt state, no active run).
+
+    Startup recovery itself is corruption-tolerant (a torn state file is
+    quarantined, not fatal); this error is for programmatic misuse such as
+    recording progress without ``begin_run()``/``attach()`` first.
+    """

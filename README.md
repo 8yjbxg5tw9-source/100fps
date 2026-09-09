@@ -13,6 +13,7 @@
 | Step 4 | Real-ESRGAN 8K upscale (tiled, async I/O) | ✅ hazır |
 | Step 5 | FFmpeg yığma + audio mux + verifikasiya | ✅ hazır |
 | Step 6 | Resurs təmizliyi və müvəqqəti fayllar | ✅ hazır |
+| Step 7 | Checkpoint & resume (çökmədən bərpa) | ✅ hazır |
 | Step 4 | Super-rezolusiya (→8K, tiled inference) | ⬜ |
 | Step 5 | Denoise / deblur / rəng bərpası | ⬜ |
 | Step 6 | Kadrların keyfiyyət yoxlaması və filtrasiyası | ⬜ |
@@ -373,6 +374,54 @@ result = Step06Cleanup(dry_run=False).run(config)
 print(result.freed_gb, result.failed)  # məs: 142.5 []
 ```
 
+## Step 7 — Checkpoint & Resume (çökmədən bərpa)
+
+Saatlarla çəkən 8K/1000 FPS emalı elektrik kəsilməsi, VRAM dolması və ya
+təsadüfi bağlanma zamanı sıfırdan başlamır — `workspace/pipeline_state.json`
+hər addımı izləyir:
+
+1. **Vəziyyət faylı** — son tamamlanmış addım (`last_completed_step`),
+   kadr indeksi (`last_processed_frame_index`), giriş video parametrləri və
+   Step 2-nin analiz nəticələri atomik yazılır (yarımçıq fayl oxunmur);
+   xarab fayl karantinə alınıb təzədən başlanılır.
+2. **Avtomatik bərpa sualı** — başlanğıcda yarımçıq iş tapılarsa istifadəçiyə
+   iki seçim çıxır: **1)** qaldığı kadrdan davam et (Resume), **2)** tərəqqini
+   sil və sıfırdan başla (Overwrite). `--resume yes/no` ilə avtomatlaşdırma
+   olur; qeyri-interaktiv shell-də avtomatik resume seçilir.
+3. **Kadr-səviyyəli resume** — disk həqiqətdir: yazılmış `frame_*.png`
+   faylları skan olunur, AI model dəqiq qaldığı kadrdan/cütdən başlayır
+   (Step 3 cüt-səviyyəli, Step 4 kadr-səviyyəli; son fayl şübhəli sayılıb
+   yenidən yazılır). Tamamlanmış addımlar (`--to-step` daxilində) keçilir.
+4. **OOM bərpası** — `CUDA out of memory` tutulub proqram çökdürülmür:
+   checkpoint dərhal yazılır, `tile_size`/`batch_size` yarıya endirilir
+   (məs: 512 → 256), GPU keşi təmizlənir və **eyni kadr** təkrar emal olunur.
+
+```bash
+# Yarımçıq run-u davam etdir (sual verir):
+python main.py --input video/in.mp4 --output video/out.mp4 --to-step 4
+
+# Sualsız resume / sıfırdan başla:
+python main.py --input video/in.mp4 --output video/out.mp4 --to-step 4 --resume yes
+python main.py --config workspace/config.json --from-step 3 --to-step 4 --resume no
+
+# Checkpoint tezliyi / tam söndürmə:
+python main.py ... --checkpoint-every 25
+python main.py ... --no-checkpoint
+```
+
+### Proqramlı istifadə (Step 7)
+
+```python
+from pipeline.checkpoint import CheckpointManager
+
+manager = CheckpointManager("workspace")
+decision = manager.decide(manager.snapshot_from_config(config), policy="ask")
+print(decision.action)  # "resume" | "overwrite" | "fresh"
+
+# Step 3/4-ə ötür: kadr cədvəli ilə tərəqqi yazılır, OOM-da retry olunur
+result = Step04Upscale(checkpoint=manager, checkpoint_every=10).run(config)
+```
+
 ### Layihə strukturu
 
 ```text
@@ -391,6 +440,7 @@ print(result.freed_gb, result.failed)  # məs: 142.5 []
 │   ├── step04_upscale.py        # STEP 4: 8K upscale orkestri (async yazı ilə)
 │   ├── step05_assemble.py       # STEP 5: FFmpeg yığma + audio + verifikasiya
 │   ├── step06_cleanup.py        # STEP 6: təhlükəsiz müvəqqəti-məlumat təmizliyi
+│   ├── checkpoint.py            # STEP 7: pipeline_state.json + resume + OOM bərpası
 │   ├── frame_io.py              # paylaşılan kadr oxuma/yazma (OpenCV)
 │   ├── rife/
 │   │   ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
@@ -409,7 +459,8 @@ print(result.freed_gb, result.failed)  # məs: 142.5 []
     ├── test_step03_interpolate.py
     ├── test_step04_upscale.py
     ├── test_step05_assemble.py
-    └── test_step06_cleanup.py
+    ├── test_step06_cleanup.py
+    └── test_step07_checkpoint.py
 ```
 
 ### Testlər

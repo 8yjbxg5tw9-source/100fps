@@ -37,13 +37,19 @@ Typical usage::
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 
 from pipeline.base import PipelineStep
+from pipeline.checkpoint import (
+    continuous_prefix_length,
+    is_oom_error,
+    scan_frame_indices,
+)
 from pipeline.config import (
     CONFIG_FILENAME,
     INTERPOLATED_FRAME_PATTERN,
@@ -51,6 +57,9 @@ from pipeline.config import (
 )
 from pipeline.exceptions import InterpolationError
 from pipeline.logger import get_logger
+
+if TYPE_CHECKING:
+    from pipeline.checkpoint import CheckpointManager
 
 
 @dataclass
@@ -67,6 +76,18 @@ class Step03Result:
     frame_pattern: str
     backend_name: str
     validation_ok: bool
+
+
+@dataclass
+class _ResumePlan:
+    """Where a crashed run restarts (Step 7 frame-level resume)."""
+
+    start_pair: int      # first source pair to (re)process
+    dense_start: int     # dense-stream index that pair starts at
+    sel_ptr: int         # first output position to (re)emit
+    written: int         # output counter value to continue from
+    complete: bool       # all target frames already on disk
+    on_disk: int         # continuous output files found (1..N, no gaps)
 
 
 class Step03Interpolate(PipelineStep[Step03Result]):
@@ -92,9 +113,15 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         backend_obj: Optional[Any] = None,  # injected backend (tests / power users)
         frame_io: Optional[Any] = None,     # injected FrameIO (tests)
         logger: Optional[logging.Logger] = None,
+        resume: bool = True,             # Step 7: continue from on-disk frames
+        checkpoint: Optional["CheckpointManager"] = None,  # Step 7: progress recorder
+        checkpoint_every: int = 10,      # record state every N pairs
+        oom_retry: bool = True,          # Step 7: halve batch + retry same pair on OOM
     ) -> None:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if checkpoint_every < 1:
+            raise ValueError(f"checkpoint_every must be >= 1, got {checkpoint_every}")
         if output_format not in ("png", "jpg"):
             raise ValueError(f"output_format must be 'png' or 'jpg', got {output_format!r}")
         self.backend_name = backend
@@ -114,38 +141,67 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         self._frame_io = frame_io
         self.log = logger or get_logger(__name__)
         self._forwards = 0
+        self.resume = resume
+        self.checkpoint = checkpoint
+        self.checkpoint_every = checkpoint_every
+        self.oom_retry = oom_retry
 
     # -- Orchestration -----------------------------------------------------------
     def run(self, config: PipelineConfig) -> Step03Result:
         self.log.info("=== Step 3: RIFE interpolation to %.1f FPS started ===", config.target_fps)
         frame_io = self._resolve_frame_io()
         backend = self._resolve_backend()
-        backend.load()
 
-        try:
-            sources = self._discover_sources(config)
-            factor = self._interpolation_factor(config)
-            exp = self.compute_exp(factor, self.max_exp)
-            dense = self.dense_count(len(sources), exp)
-            target = self.target_count(
-                len(sources), config.duration_sec, factor, config.target_fps
-            )
-            self.log.info(
-                "Source: %d frames @ %.2f FPS -> %.1f FPS needs %.2fx: "
-                "exp=%d (%dx dense = %d frames), resampled to %d output frames.",
-                len(sources), config.original_fps or 0.0, config.target_fps,
-                factor, exp, 2**exp, dense, target,
-            )
+        sources = self._discover_sources(config)
+        factor = self._interpolation_factor(config)
+        exp = self.compute_exp(factor, self.max_exp)
+        dense = self.dense_count(len(sources), exp)
+        target = self.target_count(
+            len(sources), config.duration_sec, factor, config.target_fps
+        )
+        self.log.info(
+            "Source: %d frames @ %.2f FPS -> %.1f FPS needs %.2fx: "
+            "exp=%d (%dx dense = %d frames), resampled to %d output frames.",
+            len(sources), config.original_fps or 0.0, config.target_fps,
+            factor, exp, 2**exp, dense, target,
+        )
 
-            out_dir = config.interpolated_720p
-            out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = config.interpolated_720p
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pattern = INTERPOLATED_FRAME_PATTERN.replace(".png", f".{self.output_format}")
+        selected = self.selection_indices(dense, target)
+        ckpt_params = {
+            "source_count": len(sources),
+            "exp": exp,
+            "target_count": target,
+            "pattern": pattern,
+        }
+        # Step 7: resume from on-disk frames BEFORE loading the model, so a
+        # fully-complete output dir skips GPU init entirely.
+        plan = self._plan_resume(
+            out_dir, selected, exp, target, len(sources), ckpt_params
+        )
+        if plan is not None and plan.complete:
+            return self._finish_already_complete(
+                config, backend, out_dir, pattern, len(sources), exp, dense, target
+            )
+        if plan is None:
             if self.clean_output_dir:
                 self._clean_output_dir(out_dir)
+        else:
+            self.log.info(
+                "Resuming Step 3 from output frame %d/%d "
+                "(source pair %d/%d) — %d frame(s) already on disk, "
+                "no re-processing.",
+                plan.written + 1, target,
+                plan.start_pair + 1, len(sources) - 1, plan.on_disk,
+            )
 
-            pattern = INTERPOLATED_FRAME_PATTERN.replace(".png", f".{self.output_format}")
-            selected = self.selection_indices(dense, target)
+        backend.load()
+        try:
             written, static_skips, cut_skips = self._interpolate_all(
-                backend, frame_io, sources, exp, out_dir, pattern, selected, target,
+                backend, frame_io, sources, exp, out_dir, pattern, selected,
+                target, plan, ckpt_params,
             )
         finally:
             backend.unload()  # release VRAM for Step 4 even on failure
@@ -289,6 +345,93 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         if stale:
             self.log.info("Removed %d stale interpolated frame(s).", len(stale))
 
+    # -- Step 7: resume planning ----------------------------------------------------------
+    def _plan_resume(
+        self,
+        out_dir: Path,
+        selected: List[int],
+        exp: int,
+        target: int,
+        source_count: int,
+        ckpt_params: dict,
+    ) -> Optional[_ResumePlan]:
+        """Map on-disk output files back to (pair, dense, output) coordinates.
+
+        Returns ``None`` for a fresh start (no usable files, resume disabled,
+        or checkpoint params mismatch — the caller then cleans stale files).
+        Inference is deterministic, so re-emitting the suspect frontier pair
+        overwrites byte-identical content.
+        """
+        if not self.resume:
+            return None
+        suffix = f".{self.output_format}"
+        indices = scan_frame_indices(out_dir, "frame_", suffix)
+        if not indices:
+            return None
+        on_disk = continuous_prefix_length(indices)
+        if on_disk == 0:
+            return None  # stray files only (e.g. frame_99999999) -> fresh+clean
+        if self.checkpoint is not None:
+            diffs = self.checkpoint.check_step_params(self.name, ckpt_params)
+            if diffs:
+                self.log.warning(
+                    "On-disk Step 3 frames are from different settings "
+                    "(%s) — discarding them and starting fresh.",
+                    "; ".join(diffs),
+                )
+                return None
+        if on_disk >= target:
+            return _ResumePlan(0, 0, 0, 0, True, on_disk)
+        trusted = max(0, on_disk - 1)  # last prefix file may be torn: redo it
+        if trusted == 0:
+            return _ResumePlan(0, 0, 0, 0, False, on_disk)
+        stride = 2**exp
+        frontier_dense = selected[trusted - 1]
+        start_pair = min((frontier_dense + 1) // stride, source_count - 2)
+        dense_start = start_pair * stride
+        # First output position at/after the restart pair; every position
+        # before it provably has its file on disk (selected is monotonic).
+        sel_ptr = bisect.bisect_left(selected, dense_start)
+        return _ResumePlan(start_pair, dense_start, sel_ptr, sel_ptr, False, on_disk)
+
+    def _finish_already_complete(
+        self,
+        config: PipelineConfig,
+        backend: Any,
+        out_dir: Path,
+        pattern: str,
+        source_count: int,
+        exp: int,
+        dense: int,
+        target: int,
+    ) -> Step03Result:
+        self.log.info(
+            "Step 3 outputs already complete: %d/%d frames on disk — "
+            "skipping inference entirely (no model loaded).",
+            target, target,
+        )
+        backend_name = getattr(backend, "name", self.backend_name)
+        config.interpolation_exp = exp
+        config.interpolated_frame_count = target
+        config.interpolation_backend = backend_name
+        saved = config.save(config.workspace_root / CONFIG_FILENAME)
+        self.log.info("Updated config saved for Step 4: %s", saved)
+        self.log.info("\n%s", config.summary())
+        return Step03Result(
+            source_frames=source_count,
+            exp=exp,
+            dense_count=dense,
+            target_count=target,
+            written_count=target,
+            static_skips=0,
+            cut_skips=0,
+            forwards_run=0,
+            out_dir=out_dir,
+            frame_pattern=pattern,
+            backend_name=backend_name,
+            validation_ok=True,
+        )
+
     # -- Core loop ------------------------------------------------------------------------------
     def _interpolate_all(
         self,
@@ -300,16 +443,22 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         pattern: str,
         selected: List[int],
         target: int,
+        plan: Optional[_ResumePlan],
+        ckpt_params: dict,
     ) -> tuple:
-        bar = self._make_progress_bar(target, desc="Interpolating")
-        written = 0
+        bar = self._make_progress_bar(
+            target, desc="Interpolating",
+            initial=plan.sel_ptr if plan else 0,
+        )
+        written = plan.written if plan else 0
         static_skips = 0
         cut_skips = 0
-        sel_ptr = 0
-        dense_idx = 0
+        sel_ptr = plan.sel_ptr if plan else 0
+        dense_idx = plan.dense_start if plan else 0
         num_pairs = len(sources) - 1
+        start_pair = plan.start_pair if plan else 0
 
-        prev_frame = frame_io.read(sources[0])
+        prev_frame = frame_io.read(sources[start_pair])
 
         def _emit(frame: Any) -> None:
             nonlocal written, sel_ptr
@@ -321,8 +470,17 @@ class Step03Interpolate(PipelineStep[Step03Result]):
                     bar.update(1)
                 sel_ptr += 1
 
+        def _record() -> None:
+            if self.checkpoint is not None:
+                self.checkpoint.record_progress(
+                    self.name, written, target, ckpt_params
+                )
+
+        def _on_oom() -> None:
+            _record()  # persist the frontier BEFORE retrying, crash-proof
+
         with bar:
-            for pair_idx in range(num_pairs):
+            for pair_idx in range(start_pair, num_pairs):
                 cur_frame = frame_io.read(sources[pair_idx + 1])
                 shortcut = self._pair_shortcut(prev_frame, cur_frame)
                 if shortcut == "static":
@@ -334,7 +492,10 @@ class Step03Interpolate(PipelineStep[Step03Result]):
                     cut_skips += 1
                     dense_pair = self._copies(prev_frame, 2**exp + 1)
                 else:
-                    dense_pair = self._subdivide_pair(backend, prev_frame, cur_frame, exp)
+                    dense_pair = self._subdivide_with_oom_retry(
+                        backend, prev_frame, cur_frame, exp,
+                        pair_idx, num_pairs, _on_oom,
+                    )
                 # All pairs share endpoints: emit all but the last frame,
                 # except the final pair which also emits the stream end.
                 emit = dense_pair if pair_idx == num_pairs - 1 else dense_pair[:-1]
@@ -345,8 +506,41 @@ class Step03Interpolate(PipelineStep[Step03Result]):
                 prev_frame = cur_frame
                 if (pair_idx + 1) % max(1, self.empty_cache_every) == 0:
                     backend.empty_cache()
+                if (pair_idx + 1) % max(1, self.checkpoint_every) == 0:
+                    _record()
                 bar.set_postfix_str(f"pair {pair_idx + 1}/{num_pairs}")
+            _record()
         return written, static_skips, cut_skips
+
+    def _subdivide_with_oom_retry(
+        self,
+        backend: Any,
+        first: Any,
+        last: Any,
+        exp: int,
+        pair_idx: int,
+        num_pairs: int,
+        on_oom: Callable[[], None],
+    ) -> List[Any]:
+        """Subdivide one pair, halving the batch and retrying on VRAM OOM."""
+        while True:
+            try:
+                return self._subdivide_pair(backend, first, last, exp)
+            except Exception as exc:  # noqa: BLE001 - OOM detected by inspection
+                if (
+                    not self.oom_retry
+                    or not is_oom_error(exc)
+                    or self.batch_size <= 1
+                ):
+                    raise
+                on_oom()
+                self.batch_size //= 2
+                self.log.warning(
+                    "CUDA out of memory at pair %d/%d — halved batch_size "
+                    "to %d and retrying the same pair ...",
+                    pair_idx + 1, num_pairs, self.batch_size,
+                )
+                backend.empty_cache()
 
     def _subdivide_pair(
         self, backend: Any, first: Any, last: Any, exp: int
@@ -415,13 +609,13 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         )
         return False
 
-    def _make_progress_bar(self, total: int, desc: str = "") -> Any:
+    def _make_progress_bar(self, total: int, desc: str = "", initial: int = 0) -> Any:
         try:
             from tqdm import tqdm
         except ImportError:
             self.log.warning("tqdm not installed -- progress bar disabled.")
             return _NullProgress()
-        return tqdm(total=total, desc=desc, unit="frame")
+        return tqdm(total=total, desc=desc, unit="frame", initial=initial)
 
 
 class _NullProgress:
