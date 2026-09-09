@@ -1,0 +1,7 @@
+# Optional dependencies for Step 8 (Gradio WebUI) only.
+# The CLI pipeline (main.py) does NOT need these.
+#
+#   pip install -r requirements-ui.txt
+#   python app.py            # or: python main.py --ui
+
+gradio>=4.0

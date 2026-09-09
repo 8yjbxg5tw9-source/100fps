@@ -14,6 +14,7 @@
 | Step 5 | FFmpeg yığma + audio mux + verifikasiya | ✅ hazır |
 | Step 6 | Resurs təmizliyi və müvəqqəti fayllar | ✅ hazır |
 | Step 7 | Checkpoint & resume (çökmədən bərpa) | ✅ hazır |
+| Step 8 | CLI qısayolları + Gradio WebUI | ✅ hazır |
 | Step 4 | Super-rezolusiya (→8K, tiled inference) | ⬜ |
 | Step 5 | Denoise / deblur / rəng bərpası | ⬜ |
 | Step 6 | Kadrların keyfiyyət yoxlaması və filtrasiyası | ⬜ |
@@ -422,12 +423,57 @@ print(decision.action)  # "resume" | "overwrite" | "fresh"
 result = Step04Upscale(checkpoint=manager, checkpoint_every=10).run(config)
 ```
 
+## Step 8 — CLI Qısayolları + Gradio WebUI
+
+Terminal mütəxəssisləri üçün qısa flag-lər, sıravi istifadəçilər üçün kliklə
+işləyən vizual interfeys — hər ikisi eyni `pipeline/webui.py` arxa ucunu
+paylaşır (Gradio asılılığı yoxdur, hamısı test olunur):
+
+1. **CLI** — `--resolution 8K|4K|1080p|720p|WxH` (dəqiq
+   `--target-width/--target-height` üstün gəlir), `--model` (`--esrgan-model`
+   alias-ı; Real-CUGAN planlaşdırılır), `--tile-size auto|256|512|1024`,
+   `--ui` (WebUI-ni açır), `--ui-port/--ui-share`.
+2. **WebUI (`python app.py`)** — drag & drop video yükləmə, FPS slayderi
+   (30–1000), rezolusiya/model/kodek seçimləri, canlı tərəqqi zolağı +
+   ETA + GPU temperatur/VRAM, canlı konsol, bitdikdə **Əvvəl/Sonra** video
+   müqayisəsi və ekvivalent CLI əmrinin surəti.
+3. **Asinxron arxa uc** — emal fon-thread-də gedir (interfeys donmur);
+   `ProgressBus` logları, addım bannerlərini və `FrameWatcher` ilə kadr
+   sayını brauzerə ötürür; ⏹ cari addımdan sonra dayandırır (Step 7
+   checkpoint-i qalır — sonra davam etmək olur).
+
+```bash
+# Qısa CLI:
+python main.py --input video/in.mp4 --output video/out.mp4 \
+  --resolution 4K --model x4plus-anime --tile-size auto --to-step 5
+
+# WebUI:
+pip install -r requirements-ui.txt
+python app.py                 # və ya: python main.py --ui [--ui-port 7860]
+```
+
+### Proqramlı istifadə (Step 8)
+
+```python
+import threading
+from pipeline.webui import ProgressBus, RunOptions, run_pipeline
+
+opts = RunOptions(input="video/in.mp4", resolution=(3840, 2160))
+assert opts.validate() == []
+bus, stop = ProgressBus(), threading.Event()
+threading.Thread(target=run_pipeline, args=(opts, bus, stop)).start()
+# ... bus.poll() ilə LogEvent/StepEvent/FrameProgress oxu, stop.set() ilə saxla
+print(" ".join(opts.to_cli_args()))  # ekvivalent CLI əmri
+```
+
 ### Layihə strukturu
 
 ```text
 100fps/
 ├── main.py                      # CLI giriş nöqtəsi (--from-step/--to-step)
+├── app.py                       # STEP 8: Gradio WebUI (python app.py / --ui)
 ├── requirements.txt             # Python asılılıqları
+├── requirements-ui.txt          # WebUI üçün əlavə (gradio)
 ├── pipeline/
 │   ├── __init__.py
 │   ├── base.py                  # PipelineStep abstrakt bazası (bütün 10 addım üçün)
@@ -441,6 +487,7 @@ result = Step04Upscale(checkpoint=manager, checkpoint_every=10).run(config)
 │   ├── step05_assemble.py       # STEP 5: FFmpeg yığma + audio + verifikasiya
 │   ├── step06_cleanup.py        # STEP 6: təhlükəsiz müvəqqəti-məlumat təmizliyi
 │   ├── checkpoint.py            # STEP 7: pipeline_state.json + resume + OOM bərpası
+│   ├── webui.py                 # STEP 8: RunOptions + ProgressBus + fon-runner
 │   ├── frame_io.py              # paylaşılan kadr oxuma/yazma (OpenCV)
 │   ├── rife/
 │   │   ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
@@ -460,7 +507,8 @@ result = Step04Upscale(checkpoint=manager, checkpoint_every=10).run(config)
     ├── test_step04_upscale.py
     ├── test_step05_assemble.py
     ├── test_step06_cleanup.py
-    └── test_step07_checkpoint.py
+    ├── test_step07_checkpoint.py
+    └── test_step08_webui.py
 ```
 
 ### Testlər

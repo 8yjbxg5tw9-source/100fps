@@ -29,6 +29,7 @@ from pipeline.exceptions import (
     InputVideoNotFoundError,
 )
 from pipeline.logger import get_logger
+from pipeline.webui import parse_resolution, parse_tile_size
 from pipeline.esrgan.weights import DEFAULT_ESRGAN_MODEL, ESRGAN_MODELS
 from pipeline.rife.weights import DEFAULT_RIFE_VERSION, RIFE_VERSIONS
 from pipeline.step01_environment import setup_environment
@@ -52,8 +53,22 @@ def build_parser() -> argparse.ArgumentParser:
             "Step 3: RIFE interpolation to target FPS. "
             "Step 4: Real-ESRGAN upscale to 8K. "
             "Step 5: FFmpeg assembly + verification. "
-            "Step 6: Safe cleanup of temporary data."
+            "Step 6: Safe cleanup of temporary data. "
+            "Step 7: checkpoint & resume is always on. "
+            "Step 8: --resolution / --model shortcuts, --ui for the WebUI."
         )
+    )
+    # WebUI launcher (Step 8).
+    parser.add_argument(
+        "--ui", action="store_true",
+        help="Launch the Gradio WebUI instead of running the CLI pipeline.",
+    )
+    parser.add_argument(
+        "--ui-port", type=int, default=7860, help="WebUI port (default: 7860).",
+    )
+    parser.add_argument(
+        "--ui-share", action="store_true",
+        help="Create a public gradio.live link for the WebUI.",
     )
     # Input selection.
     parser.add_argument("--input", default=None, help="Input video file (720p).")
@@ -84,15 +99,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-fps", type=float, default=TARGET_FPS, help="Target FPS (default: 1000)."
     )
-    parser.add_argument("--target-width", type=int, default=TARGET_WIDTH)
-    parser.add_argument("--target-height", type=int, default=TARGET_HEIGHT)
+    parser.add_argument(
+        "--resolution", default=None,
+        help="Target resolution shortcut: 8K, 4K, 1080p, 720p or WIDTHxHEIGHT "
+        "(default: 8K; explicit --target-width/--target-height win).",
+    )
+    parser.add_argument(
+        "--target-width", type=int, default=None,
+        help="Exact target width (default: from --resolution, else 7680).",
+    )
+    parser.add_argument(
+        "--target-height", type=int, default=None,
+        help="Exact target height (default: from --resolution, else 4320).",
+    )
     parser.add_argument(
         "--no-auto-install", action="store_true",
         help="Do not pip-install missing Python packages automatically.",
     )
     parser.add_argument(
-        "--tile-size", type=int, default=None,
-        help="Override the VRAM-derived tile_size (256/512/1024).",
+        "--tile-size", default=None,
+        help="VRAM tile size: 'auto' (default, Step 1 decides) or int (256/512/1024).",
     )
     parser.add_argument(
         "--no-save-config", action="store_true",
@@ -156,6 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--esrgan-model", choices=sorted(ESRGAN_MODELS), default=DEFAULT_ESRGAN_MODEL,
         help=f"Real-ESRGAN weights (default: {DEFAULT_ESRGAN_MODEL}).",
+    )
+    parser.add_argument(
+        "--model", dest="esrgan_model", choices=sorted(ESRGAN_MODELS),
+        default=argparse.SUPPRESS,
+        help="Alias for --esrgan-model (Real-CUGAN planned for later).",
     )
     parser.add_argument(
         "--esrgan-weights", default=None,
@@ -242,6 +273,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.ui:
+        import app
+
+        app.launch_ui(port=args.ui_port, share=args.ui_share)
+        return 0
+    try:
+        res_width, res_height = (
+            parse_resolution(args.resolution) if args.resolution
+            else (TARGET_WIDTH, TARGET_HEIGHT)
+        )
+        target_width = args.target_width or res_width
+        target_height = args.target_height or res_height
+        tile_override = parse_tile_size(args.tile_size)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
     if args.step1_only:
         args.to_step = 1
     if args.from_step > args.to_step:
@@ -287,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
                 manager = CheckpointManager(Path(args.workspace), logger=log)
                 desired = manager.snapshot_from_values(
                     args.input, args.output,
-                    args.target_fps, args.target_width, args.target_height,
+                    args.target_fps, target_width, target_height,
                 )
                 decision = manager.decide(desired, policy=args.resume)
                 log.info("Checkpoint: %s.", decision.reason)
@@ -310,10 +357,10 @@ def main(argv: list[str] | None = None) -> int:
                     final_output_path=args.output,
                     workspace_root=args.workspace,
                     target_fps=args.target_fps,
-                    target_width=args.target_width,
-                    target_height=args.target_height,
+                    target_width=target_width,
+                    target_height=target_height,
                     auto_install=not args.no_auto_install,
-                    tile_size_override=args.tile_size,
+                    tile_size_override=tile_override,
                     save_config=not args.no_save_config,
                     logger=log,
                 )

@@ -6,8 +6,9 @@ and frame extraction) consumes the config; Step 3 (RIFE interpolation to
 1000 FPS) consumes the raw frames; Step 4 (Real-ESRGAN 8K upscale) consumes
 the interpolated frames; Step 5 (FFmpeg assembly + verification) produces the
 final video; Step 6 (safe cleanup) reclaims workspace disk space; Step 7
-(checkpoint & resume) makes every run crash-proof; later steps build on all
-of them.
+(checkpoint & resume) makes every run crash-proof; Step 8 (CLI shortcuts +
+Gradio WebUI backend) makes every run one click away; later steps build on
+all of them.
 """
 
 from pipeline.checkpoint import (
@@ -23,13 +24,16 @@ from pipeline.step03_interpolate import Step03Interpolate, Step03Result
 from pipeline.step04_upscale import Step04Upscale, Step04Result
 from pipeline.step05_assemble import Step05Assemble, Step05Result
 from pipeline.step06_cleanup import Step06Cleanup, Step06Result
+from pipeline.webui import ProgressBus, RunOptions, parse_resolution
 
-__version__ = "0.7.0"  # Steps 1-7 complete
+__version__ = "0.8.0"  # Steps 1-8 complete
 __all__ = [
     "CheckpointManager",
     "PipelineConfig",
     "PipelineState",
+    "ProgressBus",
     "ResumeDecision",
+    "RunOptions",
     "Step01Environment",
     "setup_environment",
     "Step02Frames",
@@ -44,4 +48,5 @@ __all__ = [
     "Step05Result",
     "Step06Cleanup",
     "Step06Result",
+    "parse_resolution",
 ]

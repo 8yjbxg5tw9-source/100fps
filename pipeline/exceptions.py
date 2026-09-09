@@ -97,3 +97,11 @@ class CheckpointError(PipelineError):
     quarantined, not fatal); this error is for programmatic misuse such as
     recording progress without ``begin_run()``/``attach()`` first.
     """
+
+
+class WebUIError(PipelineError):
+    """Raised when Step 8 cannot start/validate a WebUI pipeline run.
+
+    Covers invalid run options (missing input, bad model/codec names, ...)
+    so the UI can show a clean message instead of a traceback.
+    """
