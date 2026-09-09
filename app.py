@@ -131,6 +131,18 @@ def create_app():
                 cleanup = gr.Checkbox(
                     False, label="🧹 Sonda müvəqqəti faylları sil (Step 6)"
                 )
+                with gr.Accordion("⚡ GPU / Performans (Step 9)", open=False):
+                    precision = gr.Dropdown(
+                        ["auto", "fp32", "fp16", "bf16"], value="auto",
+                        label="Precision (bf16 yalnız Ampere+ GPU-da)",
+                    )
+                    accel = gr.Radio(
+                        ["auto", "none"], value="auto",
+                        label="Accel (ONNX .onnx sürəti üçün CLI istifadə edin)",
+                    )
+                    profile = gr.Checkbox(
+                        False, label="📊 Benchmark hesabatı (ms/kadr, VRAM, FPS)"
+                    )
                 out = gr.Textbox("", label="Çıxış yolu (boş = avtomatik)")
                 ws = gr.Textbox("workspace", label="Workspace qovluğu")
                 with gr.Row():
@@ -154,7 +166,8 @@ def create_app():
         def _run(
             video: Optional[str], fps_v: float, res_v: str, model_v: str,
             tile_v: str, interp_v: str, upsc_v: str, codec_v: str, crf_v: float,
-            resume_v: str, cleanup_v: bool, out_v: str, ws_v: str,
+            resume_v: str, cleanup_v: bool, precision_v: str, accel_v: str,
+            profile_v: bool, out_v: str, ws_v: str,
         ) -> Iterator[Tuple[Any, ...]]:
             empty_bar = _progress_html("Gözləyir", 0, None, None, "—")
             try:
@@ -172,6 +185,9 @@ def create_app():
                     crf=float(crf_v),
                     resume=resume_v,
                     cleanup=bool(cleanup_v),
+                    precision=precision_v,
+                    accel=accel_v,
+                    profile=bool(profile_v),
                 )
             except (ValueError, KeyError) as exc:
                 yield (
@@ -289,7 +305,7 @@ def create_app():
         run_btn.click(
             _run,
             inputs=[inp, fps, res, model, tile, interp, upsc, codec, crf,
-                    resume, cleanup, out, ws],
+                    resume, cleanup, precision, accel, profile, out, ws],
             outputs=[status, progress, gpu, console, before, after, cli_box],
         )
         stop_btn.click(_stop, outputs=[status])

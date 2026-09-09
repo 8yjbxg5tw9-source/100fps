@@ -38,6 +38,7 @@ Typical usage::
 from __future__ import annotations
 
 import bisect
+import contextlib
 import logging
 import math
 from dataclasses import dataclass
@@ -57,9 +58,13 @@ from pipeline.config import (
 )
 from pipeline.exceptions import InterpolationError
 from pipeline.logger import get_logger
+from pipeline.perf import RingBufferWriter
 
 if TYPE_CHECKING:
     from pipeline.checkpoint import CheckpointManager
+    from pipeline.perf import Profiler
+
+PRECISION_CHOICES = ("auto", "fp32", "fp16", "bf16")
 
 
 @dataclass
@@ -117,6 +122,10 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         checkpoint: Optional["CheckpointManager"] = None,  # Step 7: progress recorder
         checkpoint_every: int = 10,      # record state every N pairs
         oom_retry: bool = True,          # Step 7: halve batch + retry same pair on OOM
+        writer_queue: int = 8,           # Step 9: async RAM ring depth (0 = sync)
+        profiler: Optional["Profiler"] = None,  # Step 9: stage timing spans
+        precision: str = "auto",         # Step 9: auto|fp32|fp16|bf16 (AI backend)
+        async_transfers: bool = True,    # Step 9: CUDA stream + non-blocking H2D/D2H
     ) -> None:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
@@ -124,6 +133,10 @@ class Step03Interpolate(PipelineStep[Step03Result]):
             raise ValueError(f"checkpoint_every must be >= 1, got {checkpoint_every}")
         if output_format not in ("png", "jpg"):
             raise ValueError(f"output_format must be 'png' or 'jpg', got {output_format!r}")
+        if writer_queue < 0:
+            raise ValueError(f"writer_queue must be >= 0, got {writer_queue}")
+        if precision not in PRECISION_CHOICES:
+            raise ValueError(f"precision must be one of {PRECISION_CHOICES}, got {precision!r}")
         self.backend_name = backend
         self.rife_version = rife_version
         self.weights = weights
@@ -145,6 +158,21 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         self.checkpoint = checkpoint
         self.checkpoint_every = checkpoint_every
         self.oom_retry = oom_retry
+        self.writer_queue = writer_queue
+        self.profiler = profiler
+        self.precision = precision
+        self.async_transfers = async_transfers
+
+    def _span(self, name: str):  # noqa: ANN202 - contextmanager
+        """Step 9 stage span (no-op without a profiler attached)."""
+        if self.profiler is not None:
+            return self.profiler.stage(name)
+        return contextlib.nullcontext()
+
+    def _torch_span(self, name: str):  # noqa: ANN202 - contextmanager
+        if self.profiler is not None:
+            return self.profiler.torch_span(name)
+        return contextlib.nullcontext()
 
     # -- Orchestration -----------------------------------------------------------
     def run(self, config: PipelineConfig) -> Step03Result:
@@ -301,6 +329,8 @@ class Step03Interpolate(PipelineStep[Step03Result]):
                     "weights_root": self.weights_root,
                     "device": self.device,
                     "fp16": self.fp16,
+                    "precision": self.precision,
+                    "async_transfers": self.async_transfers,
                 }
                 if self.backend_name == "rife"
                 else {}
@@ -458,7 +488,20 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         num_pairs = len(sources) - 1
         start_pair = plan.start_pair if plan else 0
 
-        prev_frame = frame_io.read(sources[start_pair])
+        # Step 9: PNG encoding moves to a background thread — inference never
+        # waits on the disk. Crash safety is unchanged: resume re-scans the
+        # disk, so frames still sitting in the RAM ring are simply redone.
+        writer = (
+            RingBufferWriter(
+                frame_io.write, capacity=self.writer_queue, logger=self.log,
+                name="step3-writer",
+            ).start()
+            if self.writer_queue > 0
+            else None
+        )
+
+        with self._span("step3/io_read"):
+            prev_frame = frame_io.read(sources[start_pair])
 
         def _emit(frame: Any) -> None:
             nonlocal written, sel_ptr
@@ -466,7 +509,10 @@ class Step03Interpolate(PipelineStep[Step03Result]):
             while sel_ptr < target and selected[sel_ptr] <= dense_idx:
                 if selected[sel_ptr] == dense_idx:
                     written += 1
-                    frame_io.write(out_dir / (pattern % written), frame)
+                    if writer is not None:
+                        writer.submit(out_dir / (pattern % written), frame)
+                    else:
+                        frame_io.write(out_dir / (pattern % written), frame)
                     bar.update(1)
                 sel_ptr += 1
 
@@ -479,37 +525,47 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         def _on_oom() -> None:
             _record()  # persist the frontier BEFORE retrying, crash-proof
 
-        with bar:
-            for pair_idx in range(start_pair, num_pairs):
-                cur_frame = frame_io.read(sources[pair_idx + 1])
-                shortcut = self._pair_shortcut(prev_frame, cur_frame)
-                if shortcut == "static":
-                    static_skips += 1
-                    dense_pair: Sequence[Any] = self._copies(
-                        prev_frame, 2**exp + 1
-                    )
-                elif shortcut == "cut":
-                    cut_skips += 1
-                    dense_pair = self._copies(prev_frame, 2**exp + 1)
-                else:
-                    dense_pair = self._subdivide_with_oom_retry(
-                        backend, prev_frame, cur_frame, exp,
-                        pair_idx, num_pairs, _on_oom,
-                    )
-                # All pairs share endpoints: emit all but the last frame,
-                # except the final pair which also emits the stream end.
-                emit = dense_pair if pair_idx == num_pairs - 1 else dense_pair[:-1]
-                for frame in emit:
-                    _emit(frame)
-                    dense_idx += 1
-                del dense_pair
-                prev_frame = cur_frame
-                if (pair_idx + 1) % max(1, self.empty_cache_every) == 0:
-                    backend.empty_cache()
-                if (pair_idx + 1) % max(1, self.checkpoint_every) == 0:
+        try:
+            with self._torch_span("step3/interpolate-all"):
+                with bar:
+                    for pair_idx in range(start_pair, num_pairs):
+                        with self._span("step3/io_read"):
+                            cur_frame = frame_io.read(sources[pair_idx + 1])
+                        with self._span("step3/shortcut"):
+                            shortcut = self._pair_shortcut(prev_frame, cur_frame)
+                        if shortcut == "static":
+                            static_skips += 1
+                            dense_pair: Sequence[Any] = self._copies(
+                                prev_frame, 2**exp + 1
+                            )
+                        elif shortcut == "cut":
+                            cut_skips += 1
+                            dense_pair = self._copies(prev_frame, 2**exp + 1)
+                        else:
+                            with self._span("step3/inference"):
+                                dense_pair = self._subdivide_with_oom_retry(
+                                    backend, prev_frame, cur_frame, exp,
+                                    pair_idx, num_pairs, _on_oom,
+                                )
+                        # All pairs share endpoints: emit all but the last
+                        # frame, except the final pair which also emits the
+                        # stream end.
+                        emit = dense_pair if pair_idx == num_pairs - 1 else dense_pair[:-1]
+                        with self._span("step3/io_write"):
+                            for frame in emit:
+                                _emit(frame)
+                                dense_idx += 1
+                        del dense_pair
+                        prev_frame = cur_frame
+                        if (pair_idx + 1) % max(1, self.empty_cache_every) == 0:
+                            backend.empty_cache()
+                        if (pair_idx + 1) % max(1, self.checkpoint_every) == 0:
+                            _record()
+                        bar.set_postfix_str(f"pair {pair_idx + 1}/{num_pairs}")
                     _record()
-                bar.set_postfix_str(f"pair {pair_idx + 1}/{num_pairs}")
-            _record()
+        finally:
+            if writer is not None:
+                writer.close()  # flush + fail-loud before validation
         return written, static_skips, cut_skips
 
     def _subdivide_with_oom_retry(

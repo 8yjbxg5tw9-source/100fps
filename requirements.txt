@@ -17,5 +17,9 @@ numpy>=1.24
 Pillow>=10.0
 tqdm>=4.66
 
+# Step 9 (optional — only for --upscale-backend onnx; the PyTorch path needs none of this):
+# onnxruntime>=1.17          # CPU wheels; use onnxruntime-gpu for CUDA/TensorRT providers
+# onnx>=1.14                  # only to export .pth -> .onnx (one-time, needs torch too)
+
 # Dev / test only:
 # pytest>=7.0

@@ -19,7 +19,9 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+import time
 from pathlib import Path
 
 from pipeline.checkpoint import CheckpointManager, steps_to_run
@@ -29,6 +31,7 @@ from pipeline.exceptions import (
     InputVideoNotFoundError,
 )
 from pipeline.logger import get_logger
+from pipeline.perf import Profiler, VramSampler, nvidia_smi_probe
 from pipeline.webui import parse_resolution, parse_tile_size
 from pipeline.esrgan.weights import DEFAULT_ESRGAN_MODEL, ESRGAN_MODELS
 from pipeline.rife.weights import DEFAULT_RIFE_VERSION, RIFE_VERSIONS
@@ -176,8 +179,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Step 4 options.
     parser.add_argument(
-        "--upscale-backend", choices=["esrgan", "resize"], default="esrgan",
-        help="'esrgan': AI upscale (needs torch); 'resize': non-AI smoke test.",
+        "--upscale-backend", choices=["esrgan", "onnx", "resize"], default="esrgan",
+        help="'esrgan': AI upscale (needs torch); 'onnx': AI via ONNX Runtime "
+        "(needs onnxruntime + .onnx weights); 'resize': non-AI smoke test.",
     )
     parser.add_argument(
         "--esrgan-model", choices=sorted(ESRGAN_MODELS), default=DEFAULT_ESRGAN_MODEL,
@@ -190,7 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--esrgan-weights", default=None,
-        help="Explicit Real-ESRGAN .pth file; skips download.",
+        help="Explicit Real-ESRGAN weights file (.pth for torch, .onnx for "
+        "ONNX Runtime — auto-selected); skips download.",
     )
     parser.add_argument(
         "--upscale-tile", type=int, default=None,
@@ -210,7 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--writer-queue", type=int, default=8,
-        help="Async writer FIFO depth (default: 8).",
+        help="Async RAM writer FIFO depth for steps 3-4 (default: 8; "
+        "0 = synchronous writes, debug only).",
     )
     # Step 5 options.
     parser.add_argument(
@@ -268,7 +274,72 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-checkpoint", action="store_true",
         help="Disable Step 7 checkpoint tracking entirely.",
     )
+    # Step 9 options (GPU acceleration + performance profiling).
+    parser.add_argument(
+        "--precision", choices=["auto", "fp32", "fp16", "bf16"], default="auto",
+        help="AI inference precision (default: auto = fp16 on CUDA, fp32 on "
+        "CPU; bf16 needs Ampere+; explicit value beats --fp32).",
+    )
+    parser.add_argument(
+        "--accel", choices=["auto", "none", "onnx"], default="auto",
+        help="Step 4 acceleration: auto (.onnx weights switch to ONNX "
+        "Runtime), none (force PyTorch), onnx (require ONNX Runtime).",
+    )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="Time every stage (disk read/inference/disk write) and print a "
+        "benchmark report (ms/frame, VRAM, processing vs target FPS).",
+    )
+    parser.add_argument(
+        "--cprofile", action="store_true",
+        help="Also run a cProfile pass over the run (saved to the workspace).",
+    )
+    parser.add_argument(
+        "--torch-profile", action="store_true",
+        help="Also capture torch.profiler kernel tables for steps 3-4.",
+    )
+    parser.add_argument(
+        "--no-async-transfer", action="store_true",
+        help="Disable CUDA streams + non-blocking transfers (debug switch).",
+    )
     return parser
+
+
+def _save_and_print_benchmark(
+    config: PipelineConfig,
+    profiler: Profiler,
+    wall_s: float,
+    step_wall: dict[int, float],
+    vram_summary: dict | None,
+    cprof_text: str | None,
+    log: logging.Logger,
+) -> None:
+    """Build the Step 9 benchmark report, save it, print the summary."""
+    from pipeline.perf import build_benchmark_report
+
+    report = build_benchmark_report(
+        target_fps=config.target_fps,
+        target_size=[config.target_width, config.target_height],
+        profiler=profiler,
+        step_wall=step_wall,
+        step_frames={
+            3: config.interpolated_frame_count or 0,
+            4: config.upscaled_frame_count or 0,
+        },
+        vram_summary=vram_summary,
+    )
+    saved = report.save(config.workspace_root / "benchmark.json")
+    log.info("Benchmark report saved: %s (run wall time %.1fs)", saved, wall_s)
+    print(report.render_text())
+    if profiler.torch_tables:
+        print()
+        print(profiler.render_torch())
+    if cprof_text is not None:
+        cprof_path = config.workspace_root / "cprofile.txt"
+        cprof_path.write_text(cprof_text, encoding="utf-8")
+        log.info("cProfile table saved: %s", cprof_path)
+        print()
+        print(cprof_text)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -294,14 +365,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.from_step > args.to_step:
         log.error("--from-step (%d) > --to-step (%d).", args.from_step, args.to_step)
         return 2
+    if args.accel == "onnx" and args.upscale_backend == "resize":
+        log.error("--accel onnx needs an AI upscale backend (--upscale-backend esrgan|onnx).")
+        return 2
+    if args.fp32 and args.precision != "auto":
+        log.warning("--fp32 is ignored because --precision %s is explicit.", args.precision)
     try:
         use_checkpoint = not args.no_checkpoint
         manager: CheckpointManager | None = None
         decision = None  # ResumeDecision when checkpointing is on
         skip_through = 0  # completed steps to skip (full-run resume only)
 
+        step_wall: dict[int, float] = {}  # Step 9: per-step wall time
+
         def _tracked(step_num: int, run_step):  # noqa: ANN001, ANN202 - tiny local helper
-            run_step()
+            started = time.perf_counter()
+            try:
+                run_step()
+            finally:
+                step_wall[step_num] = (
+                    step_wall.get(step_num, 0.0) + (time.perf_counter() - started)
+                )
             if manager is not None:
                 manager.mark_step_complete(step_num)
                 manager.refresh_snapshot(config)
@@ -402,69 +486,105 @@ def main(argv: list[str] | None = None) -> int:
             log.info("All requested steps are already complete — nothing to do.")
             return 0
 
-        if 2 in planned:
-            _tracked(2, lambda: Step02Frames(
-                image_format=args.image_format,
-                audio_format=args.audio_format,
-                clean_frame_dir=not args.keep_old_frames,
-                logger=log,
-            ).run(config))
+        # Step 9: profiling is opt-in; without flags nothing is sampled
+        # and the hot path is untouched (profiler=None => nullcontext spans).
+        profiling = args.profile or args.cprofile or args.torch_profile
+        profiler = (
+            Profiler(torch_profile=args.torch_profile) if profiling else None
+        )
+        vram = VramSampler(nvidia_smi_probe, interval=1.0)
+        vram_started = False
+        wall_start = time.perf_counter()
+        if profiler is not None:
+            if args.cprofile:
+                profiler.start_cprofile()
+            vram.start()
+            vram_started = True
+        try:
+            if 2 in planned:
+                _tracked(2, lambda: Step02Frames(
+                    image_format=args.image_format,
+                    audio_format=args.audio_format,
+                    clean_frame_dir=not args.keep_old_frames,
+                    logger=log,
+                ).run(config))
 
-        if 3 in planned:
-            _tracked(3, lambda: Step03Interpolate(
-                backend=args.backend,
-                rife_version=args.rife_version,
-                weights=args.weights,
-                weights_root="weights",
-                device=args.device,
-                fp16=False if args.fp32 else None,
-                batch_size=args.batch_size,
-                max_exp=args.max_exp,
-                output_format=args.output_format,
-                static_threshold=None if args.no_shortcuts else 1.0,
-                cut_threshold=None if args.no_shortcuts else 60.0,
-                logger=log,
-                checkpoint=manager,
-                checkpoint_every=args.checkpoint_every,
-            ).run(config))
+            if 3 in planned:
+                _tracked(3, lambda: Step03Interpolate(
+                    backend=args.backend,
+                    rife_version=args.rife_version,
+                    weights=args.weights,
+                    weights_root="weights",
+                    device=args.device,
+                    fp16=False if args.fp32 else None,
+                    batch_size=args.batch_size,
+                    max_exp=args.max_exp,
+                    output_format=args.output_format,
+                    static_threshold=None if args.no_shortcuts else 1.0,
+                    cut_threshold=None if args.no_shortcuts else 60.0,
+                    logger=log,
+                    checkpoint=manager,
+                    checkpoint_every=args.checkpoint_every,
+                    writer_queue=args.writer_queue,
+                    profiler=profiler,
+                    precision=args.precision,
+                    async_transfers=not args.no_async_transfer,
+                ).run(config))
 
-        if 4 in planned:
-            _tracked(4, lambda: Step04Upscale(
-                backend=args.upscale_backend,
-                model=args.esrgan_model,
-                weights=args.esrgan_weights,
-                weights_root="weights",
-                device=args.device,
-                fp16=False if args.fp32 else None,
-                tile=args.upscale_tile,
-                tile_pad=args.tile_pad,
-                output_format=args.upscale_format,
-                empty_cache_every=args.upscale_cache_every,
-                writer_queue=args.writer_queue,
-                logger=log,
-                checkpoint=manager,
-                checkpoint_every=args.checkpoint_every,
-            ).run(config))
+            if 4 in planned:
+                _tracked(4, lambda: Step04Upscale(
+                    backend=args.upscale_backend,
+                    model=args.esrgan_model,
+                    weights=args.esrgan_weights,
+                    weights_root="weights",
+                    device=args.device,
+                    fp16=False if args.fp32 else None,
+                    tile=args.upscale_tile,
+                    tile_pad=args.tile_pad,
+                    output_format=args.upscale_format,
+                    empty_cache_every=args.upscale_cache_every,
+                    writer_queue=args.writer_queue,
+                    logger=log,
+                    checkpoint=manager,
+                    checkpoint_every=args.checkpoint_every,
+                    profiler=profiler,
+                    precision=args.precision,
+                    async_transfers=not args.no_async_transfer,
+                    accel=args.accel,
+                ).run(config))
 
-        if 5 in planned:
-            _tracked(5, lambda: Step05Assemble(
-                video_codec=args.video_codec,
-                crf=args.crf,
-                encoder_preset=args.encoder_preset,
-                ffmpeg_args=args.ffmpeg_args,
-                verify=not args.skip_verify,
-                logger=log,
-            ).run(config))
+            if 5 in planned:
+                _tracked(5, lambda: Step05Assemble(
+                    video_codec=args.video_codec,
+                    crf=args.crf,
+                    encoder_preset=args.encoder_preset,
+                    ffmpeg_args=args.ffmpeg_args,
+                    verify=not args.skip_verify,
+                    logger=log,
+                ).run(config))
 
-        if 6 in planned:
-            _tracked(6, lambda: Step06Cleanup(
-                dry_run=args.dry_run,
-                keep_raw=args.keep_raw,
-                keep_interpolated=args.keep_interpolated,
-                keep_upscaled=args.keep_upscaled,
-                keep_audio=args.keep_audio,
-                logger=log,
-            ).run(config))
+            if 6 in planned:
+                _tracked(6, lambda: Step06Cleanup(
+                    dry_run=args.dry_run,
+                    keep_raw=args.keep_raw,
+                    keep_interpolated=args.keep_interpolated,
+                    keep_upscaled=args.keep_upscaled,
+                    keep_audio=args.keep_audio,
+                    logger=log,
+                ).run(config))
+        finally:
+            wall_s = time.perf_counter() - wall_start
+            if profiler is not None:
+                cprof_text = profiler.stop_cprofile() if args.cprofile else None
+                if vram_started:
+                    vram.stop()
+                try:
+                    _save_and_print_benchmark(
+                        config, profiler, wall_s, step_wall,
+                        vram.summary(), cprof_text, log,
+                    )
+                except Exception as exc:  # noqa: BLE001 - report must not mask run errors
+                    log.warning("Benchmark report failed: %s", exc)
     except InputVideoNotFoundError as exc:
         log.error("%s", exc)
         return 1

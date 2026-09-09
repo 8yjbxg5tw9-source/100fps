@@ -37,6 +37,7 @@ Typical usage::
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,10 @@ from pipeline.logger import get_logger
 
 if TYPE_CHECKING:
     from pipeline.checkpoint import CheckpointManager
+    from pipeline.perf import Profiler
+
+PRECISION_CHOICES = ("auto", "fp32", "fp16", "bf16")
+ACCEL_CHOICES = ("auto", "none", "onnx")
 
 
 @dataclass
@@ -80,7 +85,7 @@ class Step04Upscale(PipelineStep[Step04Result]):
 
     def __init__(
         self,
-        backend: str = "esrgan",          # "esrgan" (AI) | "resize" (smoke)
+        backend: str = "esrgan",          # "esrgan" (AI) | "onnx" (AI) | "resize" (smoke)
         model: str = "x4plus",            # "x4plus" | "x4plus-anime"
         weights: Optional[str | Path] = None,
         weights_root: str | Path = "weights",
@@ -101,6 +106,10 @@ class Step04Upscale(PipelineStep[Step04Result]):
         checkpoint_every: int = 10,      # record state every N frames
         oom_retry: bool = True,          # Step 7: halve tile + retry same frame on OOM
         min_tile: int = 64,              # floor for OOM-driven tile halving
+        profiler: Optional["Profiler"] = None,  # Step 9: stage timing spans
+        precision: str = "auto",         # Step 9: auto|fp32|fp16|bf16 (AI backend)
+        async_transfers: bool = True,    # Step 9: CUDA stream + non-blocking H2D/D2H
+        accel: str = "auto",             # Step 9: auto|none|onnx (ONNX Runtime)
     ) -> None:
         if output_format not in ("png", "jpg"):
             raise ValueError(f"output_format must be 'png' or 'jpg', got {output_format!r}")
@@ -110,6 +119,10 @@ class Step04Upscale(PipelineStep[Step04Result]):
             raise ValueError(f"checkpoint_every must be >= 1, got {checkpoint_every}")
         if min_tile < 1:
             raise ValueError(f"min_tile must be >= 1, got {min_tile}.")
+        if precision not in PRECISION_CHOICES:
+            raise ValueError(f"precision must be one of {PRECISION_CHOICES}, got {precision!r}")
+        if accel not in ACCEL_CHOICES:
+            raise ValueError(f"accel must be one of {ACCEL_CHOICES}, got {accel!r}")
         self.backend_name = backend
         self.model_name = model
         self.weights = weights
@@ -131,6 +144,21 @@ class Step04Upscale(PipelineStep[Step04Result]):
         self.checkpoint_every = checkpoint_every
         self.oom_retry = oom_retry
         self.min_tile = min_tile
+        self.profiler = profiler
+        self.precision = precision
+        self.async_transfers = async_transfers
+        self.accel = accel
+
+    def _span(self, name: str):  # noqa: ANN202 - contextmanager
+        """Step 9 stage span (no-op without a profiler attached)."""
+        if self.profiler is not None:
+            return self.profiler.stage(name)
+        return contextlib.nullcontext()
+
+    def _torch_span(self, name: str):  # noqa: ANN202 - contextmanager
+        if self.profiler is not None:
+            return self.profiler.torch_span(name)
+        return contextlib.nullcontext()
 
     # -- Orchestration -----------------------------------------------------------
     def run(self, config: PipelineConfig) -> Step04Result:
@@ -146,7 +174,7 @@ class Step04Upscale(PipelineStep[Step04Result]):
         self.log.info(
             "Upscaling %d frame(s) with %s (tile=%s, %s) ...",
             len(sources),
-            self.model_name if self.backend_name == "esrgan" else "lanczos-resize",
+            self.model_name if self.backend_name in ("esrgan", "onnx") else "lanczos-resize",
             tile if tile > 0 else "off",
             self.backend_name,
         )
@@ -190,20 +218,24 @@ class Step04Upscale(PipelineStep[Step04Result]):
         )
         try:
             with AsyncFrameWriter(frame_io, self.writer_queue, self.log) as writer:
-                with bar:
-                    for idx in range(start_idx, len(sources) + 1):
-                        frame = frame_io.read(sources[idx - 1])
-                        upscaled = self._upscale_with_oom_retry(
-                            backend, frame, idx, ckpt_params, len(sources)
-                        )
-                        writer.submit(out_dir / (pattern % idx), upscaled)
-                        del frame, upscaled
-                        if idx % max(1, self.empty_cache_every) == 0:
-                            backend.empty_cache()
-                        if idx % max(1, self.checkpoint_every) == 0:
-                            self._record(ckpt_params, idx, len(sources))
-                        bar.update(1)
-                        bar.set_postfix_str(f"{idx}/{len(sources)}")
+                with self._torch_span("step4/upscale-all"):
+                    with bar:
+                        for idx in range(start_idx, len(sources) + 1):
+                            with self._span("step4/io_read"):
+                                frame = frame_io.read(sources[idx - 1])
+                            with self._span("step4/inference"):
+                                upscaled = self._upscale_with_oom_retry(
+                                    backend, frame, idx, ckpt_params, len(sources)
+                                )
+                            with self._span("step4/io_write"):
+                                writer.submit(out_dir / (pattern % idx), upscaled)
+                            del frame, upscaled
+                            if idx % max(1, self.empty_cache_every) == 0:
+                                backend.empty_cache()
+                            if idx % max(1, self.checkpoint_every) == 0:
+                                self._record(ckpt_params, idx, len(sources))
+                            bar.update(1)
+                            bar.set_postfix_str(f"{idx}/{len(sources)}")
             written = (start_idx - 1) + writer.count
             self._record(ckpt_params, written, len(sources))
         finally:
@@ -212,7 +244,7 @@ class Step04Upscale(PipelineStep[Step04Result]):
         # OOM retries may have shrunk the tile mid-run: report what's real.
         tile = getattr(backend, "tile", tile)
         validation_ok = self._validate(written, len(sources))
-        config.esrgan_model = self.model_name if self.backend_name == "esrgan" else None
+        config.esrgan_model = self.model_name if self.backend_name in ("esrgan", "onnx") else None
         config.esrgan_backend = backend_name
         config.esrgan_tile = tile
         config.upscaled_frame_count = written
@@ -282,7 +314,7 @@ class Step04Upscale(PipelineStep[Step04Result]):
             "skipping inference entirely (no model loaded).",
             source_count, source_count,
         )
-        config.esrgan_model = self.model_name if self.backend_name == "esrgan" else None
+        config.esrgan_model = self.model_name if self.backend_name in ("esrgan", "onnx") else None
         config.esrgan_backend = backend_name
         config.esrgan_tile = tile
         config.upscaled_frame_count = source_count
@@ -349,6 +381,37 @@ class Step04Upscale(PipelineStep[Step04Result]):
             return create_upscaler(
                 "resize", logger=self.log, target_size=target
             )
+        weights_look_onnx = (
+            self.weights is not None
+            and str(self.weights).lower().endswith(".onnx")
+        )
+        if self.accel == "onnx" and not weights_look_onnx and self.backend_name != "onnx":
+            raise UpscaleError(
+                "--accel onnx needs ONNX weights: pass --esrgan-weights "
+                "model.onnx (export one with: python -m "
+                "pipeline.esrgan.onnx_backend --weights model.pth "
+                "--model x4plus --out model.onnx)."
+            )
+        if self.accel == "none" and weights_look_onnx:
+            raise UpscaleError(
+                "--accel none forces the PyTorch backend, which cannot read "
+                ".onnx weights. Use --accel auto (or backend 'onnx')."
+            )
+        if self.backend_name == "onnx":
+            if self.weights is None:
+                raise UpscaleError(
+                    "Backend 'onnx' needs explicit weights: pass "
+                    "--esrgan-weights model.onnx."
+                )
+            return create_upscaler(
+                "onnx",
+                logger=self.log,
+                model=self.model_name,
+                weights=self.weights,
+                tile=tile,
+                tile_pad=self.tile_pad,
+                target_size=target,
+            )
         return create_upscaler(
             "esrgan",
             logger=self.log,
@@ -357,6 +420,8 @@ class Step04Upscale(PipelineStep[Step04Result]):
             weights_root=self.weights_root,
             device=self.device,
             fp16=self.fp16,
+            precision=self.precision,
+            async_transfers=self.async_transfers,
             tile=tile,
             tile_pad=self.tile_pad,
             pre_pad=self.pre_pad,

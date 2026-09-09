@@ -10,18 +10,19 @@ frame loss).
 from __future__ import annotations
 
 import logging
-import queue
-import threading
 from pathlib import Path
 from typing import Any, Optional
 
 from pipeline.logger import get_logger
-
-_SENTINEL: Any = object()
+from pipeline.perf import RingBufferWriter
 
 
 class AsyncFrameWriter:
-    """FIFO background writer around any :class:`FrameIO` implementation."""
+    """FIFO background writer around any :class:`FrameIO` implementation.
+
+    Thin Step-4-compatible façade over :class:`RingBufferWriter` (Step 9):
+    same constructor, same fail-loud semantics, shared and hardened worker.
+    """
 
     def __init__(
         self,
@@ -34,80 +35,44 @@ class AsyncFrameWriter:
         self.frame_io = frame_io
         self.max_queue = max_queue
         self.log = logger or get_logger(__name__)
-        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=max_queue)
-        self._thread: Optional[threading.Thread] = None
-        self._started = False
-        self._closed = False
-        self._count = 0
-        self._error: Optional[BaseException] = None
-        self._lock = threading.Lock()
+        self._inner = RingBufferWriter(
+            frame_io.write, capacity=max_queue, logger=self.log,
+            name="frame-writer",
+        )
 
     @property
     def count(self) -> int:
-        with self._lock:
-            return self._count
+        return self._inner.count
 
     def start(self) -> "AsyncFrameWriter":
-        if self._started:
-            return self
-        self._thread = threading.Thread(
-            target=self._worker, name="frame-writer", daemon=True
-        )
-        self._thread.start()
-        self._started = True
+        self._inner.start()
         return self
 
     def submit(self, path: Path, frame: Any) -> None:
         """Enqueue one write (blocks when the queue is full: backpressure)."""
-        if not self._started:
-            raise RuntimeError("AsyncFrameWriter.submit() before start().")
-        if self._closed:
-            raise RuntimeError("AsyncFrameWriter.submit() after close().")
-        self._raise_if_failed()
-        self._queue.put((path, frame))
+        try:
+            self._inner.submit(path, frame)
+        except RuntimeError as exc:
+            # Preserve the historical error wording for callers/tests.
+            message = str(exc).replace("frame-writer", "AsyncFrameWriter")
+            raise RuntimeError(message) from exc.__cause__
 
     def close(self) -> int:
         """Flush, stop the worker, re-raise any worker error; return count."""
-        if not self._started or self._closed:
-            return self.count
-        self._closed = True
-        # Unblock the worker even if a previous submitter is still waiting:
-        # the queue always has room for the small sentinel dance below because
-        # submit() callers finish once the worker drains one item.
-        self._queue.put(_SENTINEL)
-        assert self._thread is not None
-        self._thread.join()
-        self._raise_if_failed()
-        return self.count
+        try:
+            return self._inner.close()
+        except RuntimeError as exc:
+            if "Background writer failed" in str(exc):
+                raise RuntimeError(
+                    str(exc).replace(
+                        "Background writer failed",
+                        "Background frame writer failed",
+                    )
+                ) from exc.__cause__
+            raise
 
     def __enter__(self) -> "AsyncFrameWriter":
         return self.start()
 
     def __exit__(self, *args: Any) -> None:
         self.close()
-
-    # -- internals ------------------------------------------------------------
-    def _worker(self) -> None:
-        while True:
-            item = self._queue.get()
-            try:
-                if item is _SENTINEL:
-                    return
-                path, frame = item
-                self.frame_io.write(path, frame)
-                with self._lock:
-                    self._count += 1
-            except BaseException as exc:  # noqa: BLE001 - captured, re-raised on close()
-                with self._lock:
-                    if self._error is None:
-                        self._error = exc
-                self.log.error("Frame writer failed on %s: %s", item[0] if item is not _SENTINEL else "?", exc)
-                return
-            finally:
-                self._queue.task_done()
-
-    def _raise_if_failed(self) -> None:
-        with self._lock:
-            error = self._error
-        if error is not None:
-            raise RuntimeError(f"Background frame writer failed: {error}") from error

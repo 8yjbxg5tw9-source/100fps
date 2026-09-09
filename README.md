@@ -15,13 +15,8 @@
 | Step 6 | Resurs təmizliyi və müvəqqəti fayllar | ✅ hazır |
 | Step 7 | Checkpoint & resume (çökmədən bərpa) | ✅ hazır |
 | Step 8 | CLI qısayolları + Gradio WebUI | ✅ hazır |
-| Step 4 | Super-rezolusiya (→8K, tiled inference) | ⬜ |
-| Step 5 | Denoise / deblur / rəng bərpası | ⬜ |
-| Step 6 | Kadrların keyfiyyət yoxlaması və filtrasiyası | ⬜ |
-| Step 7 | 8K kadrların videoya yığılması (FFmpeg encode) | ⬜ |
-| Step 8 | Audio sinxronizasiya və köçürmə | ⬜ |
-| Step 9 | Metadata, HDR, çıxış optimallaşdırması | ⬜ |
-| Step 10 | Təmizlik, hesabat və бенчмарк | ⬜ |
+| Step 9 | GPU sürətləndirmə + profilləmə (ONNX/TensorRT, FP16/BF16, CUDA stream-lər, benchmark) | ✅ hazır |
+| Step 10 | Final inteqrasiya + sənədləşmə | ⬜ |
 
 ---
 
@@ -466,6 +461,88 @@ threading.Thread(target=run_pipeline, args=(opts, bus, stop)).start()
 print(" ".join(opts.to_cli_args()))  # ekvivalent CLI əmri
 ```
 
+## Step 9 — GPU Sürətləndirmə + Profilləmə + Benchmark
+
+Saatlarla çəkən 8K/1000 FPS emalında hər millisaniyə hesablanır — Step 9
+GPU-nu boş gözlətməmək üçün dörd mexanizm gətirir (`pipeline/perf.py`):
+
+1. **Profilləmə (§1)** — `--profile` hər mərhələni saniyəölçənlə ölçür
+   (`step3/io_read`, `step3/inference`, `step4/io_write`, …; CUDA varsa hər
+   span sinxronizasiya olunur ki, vaxtlar dürüst olsun). `--cprofile`
+   funksiya-səviyyəli cədvəli `workspace/cprofile.txt`-yə yazır,
+   `--torch-profile` isə Step 3/4 üçün `torch.profiler` kernel cədvəllərini
+   çıxarır. Flagsız işləyəndə overhead sıfırdır.
+2. **GPU optimallaşdırma (§2)** — `--precision fp32|fp16|bf16`
+   (standart `auto`: CUDA-da fp16, CPU-da fp32; bf16 yalnız Ampere+;
+   köhnə `--fp32` hələ işləyir), `--upscale-backend onnx` ilə
+   **ONNX Runtime** (provayder sırası TensorRT → CUDA → CPU; `.onnx`
+   çəkiləri avtomatik seçilir), həmçinin CUDA stream-i + non-blocking
+   H2D/D2H köçürmələri (`--no-async-transfer` ilə söndürülür).
+3. **RAM ring buffer (§3)** — Step 3 və Step 4 PNG yazını fon-thread-ə
+   verir (`--writer-queue 8`, `0` = sinxron debug rejimi): GPU heç vaxt
+   diski gözləmir, növbə dolanda backpressure RAM-i partlatmır, yazı
+   xətası səssiz itmir (fail-loud).
+4. **Benchmark hesabatı (§4)** — run bitəndə (hətta xəta/Ctrl-C ilə
+   dayansa da) konsola çıxır və `workspace/benchmark.json`-a yazılır:
+   addım başına divar vaxtı, `ms/frame`, emal FPS-i vs hədəf FPS,
+   VRAM pik/orta (`nvidia-smi` sorğusu) və sürətləndirici kəşfi:
+
+```text
+===== Benchmark report =====
+target: 1280x720 @ 1000 FPS
+
+step      wall     frames   ms/frame   proc FPS
+step3       0.12s      200       0.60    1667.32
+step4       7.68s      200      38.38      26.06
+
+slowest frame stage: step4 (26.06 FPS processing vs 1000 FPS target)
+
+--- step4 stage breakdown ---
+  io_write         3.98s total /    19.89ms avg (54.6%)
+  inference        3.08s total /    15.41ms avg (42.3%)
+  io_read          0.12s total /     0.58ms avg (1.6%)
+
+VRAM: n/a (no GPU samples collected)
+accelerators: cuda=no, onnxruntime=yes, tensorrt=no, torch=no
+```
+
+```bash
+# Profilli run (benchmark + cProfile):
+python main.py --input video/in.mp4 --output video/out.mp4 --to-step 5 \
+  --profile --cprofile
+
+# ONNX: bir dəfə eksport et (torch lazımdır), sonra torch-suz işlət:
+python -m pipeline.esrgan.onnx_backend --weights RealESRGAN_x4plus.pth \
+  --model x4plus --out RealESRGAN_x4plus.onnx
+python main.py --input video/in.mp4 --output video/out.mp4 --to-step 5 \
+  --esrgan-weights RealESRGAN_x4plus.onnx --precision fp16 --profile
+
+# Sürətləndirməni söndür (təmiz PyTorch) / debug:
+python main.py ... --accel none
+python main.py ... --no-async-transfer --writer-queue 0
+```
+
+WebUI-də eyni seçimlər **⚡ GPU / Performans** panelindədir (precision,
+accel, benchmark checkbox-u); `.onnx` eksportu/istifadəsi CLI-dəndir.
+
+### Proqramlı istifadə (Step 9)
+
+```python
+from pipeline.perf import Profiler, build_benchmark_report
+
+profiler = Profiler()
+Step03Interpolate(profiler=profiler, precision="bf16").run(config)
+Step04Upscale(profiler=profiler, accel="auto").run(config)
+report = build_benchmark_report(
+    target_fps=config.target_fps,
+    target_size=(config.target_width, config.target_height),
+    profiler=profiler, step_wall={3: 12.0, 4: 300.0},
+    step_frames={3: 200, 4: 200},
+)
+report.save("workspace/benchmark.json")
+print(report.render_text())
+```
+
 ### Layihə strukturu
 
 ```text
@@ -488,6 +565,7 @@ print(" ".join(opts.to_cli_args()))  # ekvivalent CLI əmri
 │   ├── step06_cleanup.py        # STEP 6: təhlükəsiz müvəqqəti-məlumat təmizliyi
 │   ├── checkpoint.py            # STEP 7: pipeline_state.json + resume + OOM bərpası
 │   ├── webui.py                 # STEP 8: RunOptions + ProgressBus + fon-runner
+│   ├── perf.py                  # STEP 9: Profiler + ring writer + VRAM + benchmark
 │   ├── frame_io.py              # paylaşılan kadr oxuma/yazma (OpenCV)
 │   ├── rife/
 │   │   ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
@@ -495,7 +573,8 @@ print(" ".join(opts.to_cli_args()))  # ekvivalent CLI əmri
 │   │   ├── io.py                # geriyə-uyğun shim (frame_io-ya)
 │   │   └── vendor/              # rəsmi RIFE v4 kodu (MIT) + VENDOR.md
 │   └── esrgan/
-│       ├── backends.py          # esrgan (PyTorch AI) / resize (smoke)
+│       ├── backends.py          # esrgan (PyTorch AI) / onnx / resize (smoke)
+│       ├── onnx_backend.py      # STEP 9: ONNX Runtime + .pth→.onnx eksport
 │       ├── tiling.py            # torch-suz tile həndəsəsi (rəsmi riyaziyyat)
 │       ├── weights.py           # çəki həlli + GitHub auto-yükləmə
 │       ├── writer.py            # fon-thread async yazıcı
@@ -508,7 +587,8 @@ print(" ".join(opts.to_cli_args()))  # ekvivalent CLI əmri
     ├── test_step05_assemble.py
     ├── test_step06_cleanup.py
     ├── test_step07_checkpoint.py
-    └── test_step08_webui.py
+    ├── test_step08_webui.py
+    └── test_step09_perf.py
 ```
 
 ### Testlər

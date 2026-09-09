@@ -125,6 +125,10 @@ class RunOptions:
     cleanup: bool = False               # also run Step 6 at the end
     checkpoint_every: int = 10
     auto_install: bool = False          # UI default: never pip-install mid-run
+    precision: str = "auto"             # Step 9: auto|fp32|fp16|bf16
+    accel: str = "auto"                 # Step 9: auto|none (UI has no .onnx picker)
+    profile: bool = False               # Step 9: benchmark report at the end
+    async_transfers: bool = True        # Step 9: CUDA streams (debug off-switch)
 
     def resolution_label(self) -> str:
         w, h = self.resolution
@@ -176,6 +180,13 @@ class RunOptions:
             errors.append(f"Resume rejimi auto/resume/fresh olmalıdır: {self.resume!r}.")
         if self.checkpoint_every < 1:
             errors.append("checkpoint_every ən azı 1 olmalıdır.")
+        if self.precision not in ("auto", "fp32", "fp16", "bf16"):
+            errors.append(f"Naməlum precision: {self.precision!r} (auto/fp32/fp16/bf16).")
+        if self.accel not in ("auto", "none"):
+            errors.append(
+                f"UI-də accel yalnız auto/none ola bilər: {self.accel!r} "
+                f"(.onnx üçün CLI istifadə edin)."
+            )
         return errors
 
     def to_cli_args(self) -> List[str]:
@@ -201,6 +212,14 @@ class RunOptions:
         ]
         if self.crf != 19.0:
             args += ["--crf", f"{self.crf:g}"]
+        if self.precision != "auto":
+            args += ["--precision", self.precision]
+        if self.accel != "auto":
+            args += ["--accel", self.accel]
+        if self.profile:
+            args.append("--profile")
+        if not self.async_transfers:
+            args.append("--no-async-transfer")
         if not self.auto_install:
             args.append("--no-auto-install")
         return args
@@ -470,6 +489,13 @@ def run_pipeline(
     handler = bus.handler()
     log.addHandler(handler)
     watchers: List[FrameWatcher] = []
+    # Step 9: initialised before try: so the finally-report never sees
+    # unbound names when setup itself fails.
+    profiler = None
+    vram = None
+    vram_started = False
+    config: Optional[PipelineConfig] = None
+    step_wall: Dict[int, float] = {}
     try:
         output = str(opts.output_path())
         bus.publish(StatusEvent("started", f"Giriş: {opts.input}"))
@@ -511,7 +537,16 @@ def run_pipeline(
         if skip:
             bus.log("INFO", f"Bitmiş addımlar keçilir: 1..{skip}.")
 
+        if opts.profile:
+            from pipeline.perf import Profiler, VramSampler, nvidia_smi_probe
+
+            profiler = Profiler()
+            vram = VramSampler(nvidia_smi_probe, interval=1.0)
+            vram.start()
+            vram_started = True
+
         for step_num in planned:
+            _t0 = time.monotonic()
             if stop.is_set():
                 return RunResult(
                     "cancelled", None,
@@ -544,6 +579,9 @@ def run_pipeline(
                         checkpoint=manager,
                         checkpoint_every=opts.checkpoint_every,
                         logger=log,
+                        profiler=profiler,
+                        precision=opts.precision,
+                        async_transfers=opts.async_transfers,
                     ).run(config)
                 finally:
                     watch_stop.set()
@@ -567,6 +605,10 @@ def run_pipeline(
                         checkpoint=manager,
                         checkpoint_every=opts.checkpoint_every,
                         logger=log,
+                        profiler=profiler,
+                        precision=opts.precision,
+                        async_transfers=opts.async_transfers,
+                        accel=opts.accel,
                     ).run(config)
                 finally:
                     watch_stop.set()
@@ -580,6 +622,7 @@ def run_pipeline(
             manager.mark_step_complete(step_num)
             manager.refresh_snapshot(config)
             done_steps.append(step_num)
+            step_wall[step_num] = time.monotonic() - _t0
             bus.publish(StatusEvent("step-done", f"Addım {step_num} bitdi."))
 
         final = output if Path(output).is_file() else None
@@ -591,4 +634,25 @@ def run_pipeline(
     finally:
         for watcher in watchers:
             watcher.stop_event.set()
+        if vram_started and vram is not None:
+            vram.stop()
+        if profiler is not None and config is not None:
+            try:
+                from pipeline.perf import build_benchmark_report
+
+                report = build_benchmark_report(
+                    target_fps=config.target_fps,
+                    target_size=[config.target_width, config.target_height],
+                    profiler=profiler,
+                    step_wall=step_wall,
+                    step_frames={
+                        3: config.interpolated_frame_count or 0,
+                        4: config.upscaled_frame_count or 0,
+                    },
+                )
+                saved = report.save(config.workspace_root / "benchmark.json")
+                bus.log("INFO", f"Benchmark hesabatı: {saved}")
+                bus.log("INFO", "\n" + report.render_text())
+            except Exception as exc:  # noqa: BLE001 - report must not mask run errors
+                bus.log("WARNING", f"Benchmark hesabatı alınmadı: {exc}")
         log.removeHandler(handler)

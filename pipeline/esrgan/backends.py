@@ -3,11 +3,16 @@
 - :class:`TorchESRGANBackend` (``"esrgan"``, default) — the real AI path: a
   faithful port of upstream ``RealESRGANer`` (pre-pad → tiled/direct RRDBNet
   forward → post-crop → Lanczos outscale) with ``eval`` + ``no_grad`` + CUDA
-  fp16, VRAM-safe tiling from :mod:`pipeline.esrgan.tiling`, and OOM-safe
-  tile halving.
+  mixed precision (fp16/bf16), VRAM-safe tiling from
+  :mod:`pipeline.esrgan.tiling`, a dedicated CUDA stream with non-blocking
+  transfers, and OOM-safe tile halving.
 - :class:`ResizeBackend` (``"resize"``) — plain OpenCV Lanczos upscale.
   **Not AI**, only for smoke-testing the pipeline on machines without
   torch/CUDA. Never use for real output.
+- :class:`OnnxESRGANBackend` (``"onnx"``, in
+  :mod:`pipeline.esrgan.onnx_backend`) — the accelerated AI path: an
+  exported ``.onnx`` graph on ONNX Runtime (TensorRT → CUDA → CPU
+  providers), auto-selected when weights end in ``.onnx``.
 
 Backends map RGB ``uint8`` ``(H, W, 3)`` frames to RGB ``uint8`` frames at the
 exact configured target size (default 7680x4320). ``numpy``/``torch``/``cv2``
@@ -16,6 +21,7 @@ are imported lazily so this module stays importable on a bare interpreter.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -30,6 +36,7 @@ from pipeline.esrgan.weights import (
 )
 from pipeline.exceptions import EsrganInferenceError
 from pipeline.logger import get_logger
+from pipeline.perf import resolve_torch_precision
 
 
 class EsrganBackend(ABC):
@@ -65,6 +72,8 @@ class TorchESRGANBackend(EsrganBackend):
         weights_root: str | Path = WEIGHTS_DIRNAME,
         device: Optional[str] = None,  # "cuda" | "cpu" | None (auto)
         fp16: Optional[bool] = None,  # None -> True on CUDA, False on CPU
+        precision: Optional[str] = None,  # Step 9: auto|fp32|fp16|bf16 (beats fp16)
+        async_transfers: bool = True,  # Step 9: CUDA stream + non-blocking H2D/D2H
         tile: int = 0,  # 0 = whole-image inference, else tiled (Step 1 value)
         tile_pad: int = 10,  # upstream default halo
         pre_pad: int = 0,  # upstream inference-script default
@@ -81,18 +90,27 @@ class TorchESRGANBackend(EsrganBackend):
         self.info = ESRGAN_MODELS[model]
         self.weights_override = weights
         self.weights_root = weights_root
+        if weights is not None and str(weights).lower().endswith(".onnx"):
+            raise EsrganInferenceError(
+                "The PyTorch backend cannot read .onnx weights — use backend "
+                "'onnx' (create_upscaler auto-selects it for .onnx files)."
+            )
         self.device_request = device
         self.fp16_request = fp16
+        self.precision_request = precision
+        self.async_transfers = async_transfers
         self.tile = tile
         self.tile_pad = tile_pad
         self.pre_pad = pre_pad
         self.target_size = (int(target_size[0]), int(target_size[1]))
         self.log = logger or get_logger(__name__)
         self.device: Optional[str] = None
-        self.fp16: bool = False
+        self.dtype_name: str = "fp32"
+        self.fp16: bool = False  # legacy mirror of dtype_name == "fp16"
         self.weights_path: Optional[Path] = None
         self._model: Optional[object] = None
         self._torch: Optional[object] = None
+        self._stream: Optional[object] = None  # dedicated CUDA stream (Step 9)
 
     # -- lifecycle ----------------------------------------------------------
     def load(self) -> None:
@@ -109,7 +127,12 @@ class TorchESRGANBackend(EsrganBackend):
             ) from exc
         self._torch = torch
         self.device = self._resolve_device(torch)
-        self.fp16 = self._resolve_fp16()
+        self.dtype_name = resolve_torch_precision(
+            torch, self.device, self.precision_request, self.fp16_request,
+            self.log,
+        )
+        self.fp16 = self.dtype_name == "fp16"
+        self._stream = self._make_stream(torch)
         self.weights_path = ensure_esrgan_weights(
             model=self.model_name,
             weights_root=self.weights_root,
@@ -119,9 +142,10 @@ class TorchESRGANBackend(EsrganBackend):
         from pipeline.esrgan.vendor.upstream.rrdbnet import RRDBNet
 
         self.log.info(
-            "Loading Real-ESRGAN %s on %s (fp16=%s, tile=%s) ...",
-            self.model_name, self.device, self.fp16,
+            "Loading Real-ESRGAN %s on %s (precision=%s, tile=%s, async_transfers=%s) ...",
+            self.model_name, self.device, self.dtype_name,
             self.tile if self.tile > 0 else "off",
+            self._stream is not None,
         )
         net = RRDBNet(
             num_in_ch=3, num_out_ch=3, scale=self.info.scale,
@@ -146,10 +170,30 @@ class TorchESRGANBackend(EsrganBackend):
             ) from exc
         net.eval()
         net.to(self.device)
-        if self.fp16:
+        if self.dtype_name == "fp16":
             net.half()
+        elif self.dtype_name == "bf16":
+            net.to(torch.bfloat16)
         self._model = net
         self.log.info("Real-ESRGAN model ready (eval mode, no_grad inference).")
+
+    def _make_stream(self, torch: object) -> Optional[object]:
+        """Dedicated compute stream (CUDA + enabled); else None = default."""
+        if not self.async_transfers or self.device != "cuda":
+            return None
+        stream = torch.cuda.Stream()  # type: ignore[attr-defined]
+        self.log.info("Async GPU transfers enabled (dedicated CUDA stream).")
+        return stream
+
+    def _compute_ctx(self):  # noqa: ANN202 - contextmanager
+        """Run tile forwards on the compute stream (or default stream)."""
+        if self._stream is not None and self._torch is not None:
+            return self._torch.cuda.stream(self._stream)
+        return contextlib.nullcontext()
+
+    def _sync_if_stream(self) -> None:
+        if self._stream is not None and self._torch is not None:
+            self._torch.cuda.synchronize()
 
     def _resolve_device(self, torch: object) -> str:
         cuda_available = bool(torch.cuda.is_available())  # type: ignore[attr-defined]
@@ -176,14 +220,6 @@ class TorchESRGANBackend(EsrganBackend):
             )
         return chosen
 
-    def _resolve_fp16(self) -> bool:
-        if self.fp16_request is None:
-            return self.device == "cuda"
-        if self.fp16_request and self.device == "cpu":
-            self.log.warning("fp16 on CPU is unsupported -- falling back to fp32.")
-            return False
-        return self.fp16_request
-
     # -- inference (upstream RealESRGANer procedure) ------------------------
     def upscale(self, frame: object) -> object:
         if self._model is None or self._torch is None:
@@ -206,7 +242,8 @@ class TorchESRGANBackend(EsrganBackend):
                 if self.tile > 0:
                     out = self._forward_tiled(tensor)
                 else:
-                    out = self._model(tensor)  # type: ignore[operator]
+                    with self._compute_ctx():
+                        out = self._model(tensor)  # type: ignore[operator]
                 out = self._post_process(out)
                 return self._to_target_size(out)
             except RuntimeError as exc:
@@ -234,8 +271,10 @@ class TorchESRGANBackend(EsrganBackend):
         arr = np.asarray(img, dtype=np.float32) / 255.0
         tensor = torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1)))  # type: ignore[attr-defined]
         tensor = tensor.unsqueeze(0).to(self.device, non_blocking=True)
-        if self.fp16:
+        if self.dtype_name == "fp16":
             tensor = tensor.half()
+        elif self.dtype_name == "bf16":
+            tensor = tensor.to(torch.bfloat16)
         if self.pre_pad != 0:  # upstream reflect pre-pad
             import torch.nn.functional as F
 
@@ -246,12 +285,13 @@ class TorchESRGANBackend(EsrganBackend):
         _, _, h, w = img.shape  # type: ignore[union-attr]
         scale = self.info.scale
         out = img.new_zeros((1, 3, h * scale, w * scale))  # type: ignore[union-attr]
-        for plan in plan_tiles(h, w, self.tile, self.tile_pad, scale):
-            tile_in = img[:, :, plan.in_y0:plan.in_y1, plan.in_x0:plan.in_x1]  # type: ignore[index]
-            tile_out = self._model(tile_in)  # type: ignore[operator]
-            out[:, :, plan.out_y0:plan.out_y1, plan.out_x0:plan.out_x1] = tile_out[  # type: ignore[index]
-                :, :, plan.tile_y0:plan.tile_y1, plan.tile_x0:plan.tile_x1
-            ]
+        with self._compute_ctx():
+            for plan in plan_tiles(h, w, self.tile, self.tile_pad, scale):
+                tile_in = img[:, :, plan.in_y0:plan.in_y1, plan.in_x0:plan.in_x1]  # type: ignore[index]
+                tile_out = self._model(tile_in)  # type: ignore[operator]
+                out[:, :, plan.out_y0:plan.out_y1, plan.out_x0:plan.out_x1] = tile_out[  # type: ignore[index]
+                    :, :, plan.tile_y0:plan.tile_y1, plan.tile_x0:plan.tile_x1
+                ]
         return out
 
     def _post_process(self, out: object) -> object:
@@ -264,7 +304,14 @@ class TorchESRGANBackend(EsrganBackend):
     def _to_target_size(self, out: object) -> object:
         import numpy as np
 
-        arr = out.data.squeeze().float().cpu().clamp_(0, 1).numpy()  # type: ignore[union-attr]
+        cpu = out.data.squeeze().float()  # type: ignore[union-attr]
+        if self._stream is not None:
+            # Async D2H on the compute stream; sync before numpy() touches it.
+            cpu = cpu.to("cpu", non_blocking=True)
+            self._sync_if_stream()
+            arr = cpu.clamp_(0, 1).numpy()
+        else:
+            arr = cpu.cpu().clamp_(0, 1).numpy()
         rgb = np.transpose(arr, (1, 2, 0))
         target_w, target_h = self.target_size
         if (rgb.shape[1], rgb.shape[0]) != (target_w, target_h):
@@ -291,6 +338,7 @@ class TorchESRGANBackend(EsrganBackend):
 
     def unload(self) -> None:
         self._model = None
+        self._stream = None
         self.empty_cache()
         self.log.info("Real-ESRGAN backend unloaded (VRAM released for Step 5).")
 
@@ -332,7 +380,38 @@ class ResizeBackend(EsrganBackend):
 def create_upscaler(
     name: str, logger: Optional[logging.Logger] = None, **kwargs: object
 ) -> EsrganBackend:
-    """Factory: ``'esrgan'`` -> TorchESRGANBackend, ``'resize'`` -> ResizeBackend."""
+    """Factory: ``'esrgan'`` -> torch, ``'onnx'`` -> ONNX Runtime, ``'resize'`` -> Lanczos.
+
+    ``'esrgan'`` auto-switches to ONNX Runtime when ``weights`` ends in
+    ``.onnx`` (Step 9): the graph needs no PyTorch at runtime.
+    """
+    from pipeline.esrgan.onnx_backend import OnnxESRGANBackend
+
+    wants_onnx = name == OnnxESRGANBackend.name or (
+        name == TorchESRGANBackend.name
+        and kwargs.get("weights") is not None
+        and str(kwargs["weights"]).lower().endswith(".onnx")
+    )
+    if wants_onnx:
+        log = logger or get_logger(__name__)
+        if name == TorchESRGANBackend.name:
+            log.info(
+                "Detected .onnx weights — using the ONNX Runtime backend "
+                "(TensorRT/CUDA/CPU) instead of PyTorch."
+            )
+        allowed = {"model", "weights", "tile", "tile_pad", "target_size", "providers"}
+        # Torch-only knobs ORT cannot honour: silently accepted, it picks its
+        # own provider/precision. Pre-pad changes pixels, so it warns.
+        silent = {"device", "fp16", "precision", "async_transfers", "weights_root"}
+        extra = sorted(set(kwargs) - allowed - silent)
+        if extra:
+            log.warning("ONNX backend ignores extra options: %s", extra)
+        if kwargs.get("pre_pad"):
+            log.warning("ONNX backend ignores pre_pad (torch path only).")
+        return OnnxESRGANBackend(
+            logger=log,
+            **{k: v for k, v in kwargs.items() if k in allowed},  # type: ignore[arg-type]
+        )
     if name == TorchESRGANBackend.name:
         return TorchESRGANBackend(logger=logger, **kwargs)  # type: ignore[arg-type]
     if name == ResizeBackend.name:
@@ -347,6 +426,7 @@ def create_upscaler(
             **{k: v for k, v in kwargs.items() if k in allowed},  # type: ignore[arg-type]
         )
     raise EsrganInferenceError(
-        f"Unknown backend {name!r}. Available: 'esrgan' (AI, needs torch) "
-        f"and 'resize' (non-AI smoke test)."
+        f"Unknown backend {name!r}. Available: 'esrgan' (AI, needs torch), "
+        f"'onnx' (AI, needs onnxruntime + .onnx weights) and 'resize' "
+        f"(non-AI smoke test)."
     )

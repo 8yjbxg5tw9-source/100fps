@@ -1,8 +1,10 @@
 """Interpolation backends for Step 3.
 
 - :class:`TorchRifeBackend` (``"rife"``, default) — the real AI path: vendored
-  official RIFE v4 network on CUDA with fp16 + ``no_grad``, batched forward
-  passes, 32-px padding (upstream formula) and OOM-safe batch halving.
+  official RIFE v4 network on CUDA with mixed precision (fp16/bf16) +
+  ``no_grad``, batched forward passes, 32-px padding (upstream formula),
+  a dedicated CUDA stream with non-blocking transfers, and OOM-safe
+  batch halving.
 - :class:`BlendBackend` (``"blend"``) — plain linear cross-fade. **Not AI**,
   only for smoke-testing the pipeline/orchestration on machines without
   torch/CUDA. Never use for real output.
@@ -14,6 +16,7 @@ bare interpreter (unit tests inject fakes instead).
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -21,6 +24,7 @@ from typing import List, Optional
 
 from pipeline.exceptions import RifeInferenceError
 from pipeline.logger import get_logger
+from pipeline.perf import resolve_torch_precision
 from pipeline.rife.weights import (
     DEFAULT_RIFE_VERSION,
     WEIGHTS_DIRNAME,
@@ -74,6 +78,8 @@ class TorchRifeBackend(RifeBackend):
         weights_root: str | Path = WEIGHTS_DIRNAME,
         device: Optional[str] = None,  # "cuda" | "cpu" | None (auto)
         fp16: Optional[bool] = None,  # None -> True on CUDA, False on CPU
+        precision: Optional[str] = None,  # Step 9: auto|fp32|fp16|bf16 (beats fp16)
+        async_transfers: bool = True,  # Step 9: CUDA stream + non-blocking H2D/D2H
         scale_list: Optional[List[float]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -82,13 +88,17 @@ class TorchRifeBackend(RifeBackend):
         self.weights_root = weights_root
         self.device_request = device
         self.fp16_request = fp16
+        self.precision_request = precision
+        self.async_transfers = async_transfers
         self.scale_list = list(scale_list) if scale_list else [4.0, 2.0, 1.0]
         self.log = logger or get_logger(__name__)
         self.device: Optional[str] = None
-        self.fp16: bool = False
+        self.dtype_name: str = "fp32"
+        self.fp16: bool = False  # legacy mirror of dtype_name == "fp16"
         self.weights_path: Optional[Path] = None
         self._model: Optional[object] = None
         self._torch: Optional[object] = None
+        self._stream: Optional[object] = None  # dedicated CUDA stream (Step 9)
 
     # -- lifecycle ----------------------------------------------------------
     def load(self) -> None:
@@ -105,7 +115,12 @@ class TorchRifeBackend(RifeBackend):
             ) from exc
         self._torch = torch
         self.device = self._resolve_device(torch)
-        self.fp16 = self._resolve_fp16()
+        self.dtype_name = resolve_torch_precision(
+            torch, self.device, self.precision_request, self.fp16_request,
+            self.log,
+        )
+        self.fp16 = self.dtype_name == "fp16"
+        self._stream = self._make_stream(torch)
         self.weights_path = ensure_weights(
             version=self.version,
             weights_root=self.weights_root,
@@ -115,17 +130,38 @@ class TorchRifeBackend(RifeBackend):
         from pipeline.rife.vendor.model import RifeModel
 
         self.log.info(
-            "Loading RIFE v%s on %s (fp16=%s) ...",
-            self.version, self.device, self.fp16,
+            "Loading RIFE v%s on %s (precision=%s, async_transfers=%s) ...",
+            self.version, self.device, self.dtype_name,
+            self._stream is not None,
         )
         try:
             model = RifeModel(str(self.weights_path)).eval().to(self.device)
         except RuntimeError as exc:
             raise RifeInferenceError(f"RIFE weight load failed: {exc}") from exc
-        if self.fp16:
+        if self.dtype_name == "fp16":
             model.half()  # mirrors upstream fp16 inference
+        elif self.dtype_name == "bf16":
+            model.to(torch.bfloat16)
         self._model = model
         self.log.info("RIFE model ready (eval mode, no_grad inference).")
+
+    def _make_stream(self, torch: object) -> Optional[object]:
+        """Dedicated compute stream (CUDA + enabled); else None = default."""
+        if not self.async_transfers or self.device != "cuda":
+            return None
+        stream = torch.cuda.Stream()  # type: ignore[attr-defined]
+        self.log.info("Async GPU transfers enabled (dedicated CUDA stream).")
+        return stream
+
+    def _compute_ctx(self):  # noqa: ANN202 - contextmanager
+        """Run a micro-batch on the compute stream (or default stream)."""
+        if self._stream is not None and self._torch is not None:
+            return self._torch.cuda.stream(self._stream)
+        return contextlib.nullcontext()
+
+    def _sync_if_stream(self) -> None:
+        if self._stream is not None and self._torch is not None:
+            self._torch.cuda.synchronize()
 
     def _resolve_device(self, torch: object) -> str:
         cuda_available = bool(torch.cuda.is_available())  # type: ignore[attr-defined]
@@ -151,14 +187,6 @@ class TorchRifeBackend(RifeBackend):
                 "at 720p). A CUDA GPU is strongly recommended for Step 3."
             )
         return chosen
-
-    def _resolve_fp16(self) -> bool:
-        if self.fp16_request is None:
-            return self.device == "cuda"
-        if self.fp16_request and self.device == "cpu":
-            self.log.warning("fp16 on CPU is unsupported -- falling back to fp32.")
-            return False
-        return self.fp16_request
 
     # -- inference ----------------------------------------------------------
     def interpolate_batch(
@@ -191,19 +219,28 @@ class TorchRifeBackend(RifeBackend):
 
         batch_size = int(np.asarray(frames0).shape[0])
         micro = batch_size
+        streamed = self._stream is not None
         while True:
             try:
-                outputs = []
+                pending = []
                 for start in range(0, batch_size, micro):
-                    t0 = _to_tensor(torch, frames0, start, start + micro, self.fp16)  # type: ignore[arg-type]
-                    t1 = _to_tensor(torch, frames1, start, start + micro, self.fp16)  # type: ignore[arg-type]
-                    t0 = _pad(torch, t0, ph, pw, self.device or "cpu")
-                    t1 = _pad(torch, t1, ph, pw, self.device or "cpu")
-                    mid = self._model.inference(t0, t1, list(self.scale_list), timestep)  # type: ignore[union-attr]
-                    mid = mid[:, :, :h, :w]
-                    out = (mid.clamp(0, 1) * 255.0).byte().cpu().numpy()
-                    outputs.append(np.transpose(out, (0, 2, 3, 1)))
-                    del t0, t1, mid, out
+                    # H2D copies are non-blocking; on the compute stream they
+                    # overlap the previous micro-batch's kernels (Step 9).
+                    with self._compute_ctx():
+                        t0 = _to_tensor(torch, frames0, start, start + micro, self.dtype_name)  # type: ignore[arg-type]
+                        t1 = _to_tensor(torch, frames1, start, start + micro, self.dtype_name)  # type: ignore[arg-type]
+                        t0 = _pad(torch, t0, ph, pw, self.device or "cpu")
+                        t1 = _pad(torch, t1, ph, pw, self.device or "cpu")
+                        mid = self._model.inference(t0, t1, list(self.scale_list), timestep)  # type: ignore[union-attr]
+                        mid = mid[:, :, :h, :w]
+                        gpu_out = (mid.clamp(0, 1) * 255.0).byte()
+                        # D2H copy joins the stream; numpy() below only runs
+                        # after the single batch-level synchronisation.
+                        out = gpu_out.to("cpu", non_blocking=True) if streamed else gpu_out.cpu()
+                        pending.append(out)
+                        del t0, t1, mid, gpu_out, out
+                self._sync_if_stream()
+                outputs = [np.transpose(o.numpy(), (0, 2, 3, 1)) for o in pending]
                 return np.concatenate(outputs, axis=0) if len(outputs) > 1 else outputs[0]
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower() or micro <= 1:
@@ -230,6 +267,7 @@ class TorchRifeBackend(RifeBackend):
 
     def unload(self) -> None:
         self._model = None
+        self._stream = None
         self.empty_cache()
         self.log.info("RIFE backend unloaded (VRAM released for Step 4).")
 
@@ -239,14 +277,18 @@ def _padded_size(h: int, w: int, multiple: int = 32) -> tuple:
     return ((h - 1) // multiple + 1) * multiple, ((w - 1) // multiple + 1) * multiple
 
 
-def _to_tensor(torch: object, batch: object, start: int, end: int, fp16: bool) -> object:
+def _to_tensor(torch: object, batch: object, start: int, end: int, dtype_name: str) -> object:
     import numpy as np
 
     arr = np.asarray(batch)[start:end].transpose(0, 3, 1, 2)  # B,H,W,3 -> B,3,H,W
     tensor = torch.from_numpy(np.ascontiguousarray(arr)).float() / 255.0  # type: ignore[attr-defined]
     device = "cuda" if torch.cuda.is_available() else "cpu"  # type: ignore[attr-defined]
     tensor = tensor.to(device, non_blocking=True)
-    return tensor.half() if fp16 else tensor
+    if dtype_name == "fp16":
+        return tensor.half()
+    if dtype_name == "bf16":
+        return tensor.to(torch.bfloat16)
+    return tensor
 
 
 def _pad(torch: object, tensor: object, ph: int, pw: int, device: str) -> object:
