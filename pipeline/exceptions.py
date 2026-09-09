@@ -72,3 +72,19 @@ class AssemblyError(PipelineError):
 
 class OutputVerificationError(PipelineError):
     """Raised when the assembled video fails resolution/FPS verification."""
+
+
+class CleanupSafetyError(PipelineError):
+    """Raised when Step 6 refuses to delete (final video missing/empty).
+
+    This is a *refusal*, not a crash: nothing is deleted and the message
+    tells the user exactly why cleanup was skipped.
+    """
+
+
+class CleanupError(PipelineError):
+    """Raised when Step 6 itself fails unexpectedly (not partial file errors).
+
+    Individual locked/unreadable files never raise -- they are collected in
+    the result's ``failed`` list and reported as warnings instead.
+    """

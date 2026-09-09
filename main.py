@@ -34,10 +34,11 @@ from pipeline.step02_frames import Step02Frames
 from pipeline.step03_interpolate import Step03Interpolate
 from pipeline.step04_upscale import Step04Upscale
 from pipeline.step05_assemble import Step05Assemble
+from pipeline.step06_cleanup import Step06Cleanup
 
 log = get_logger("main")
 
-LAST_STEP = 5
+LAST_STEP = 6
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,7 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Step 2: metadata probe, audio + frame extraction. "
             "Step 3: RIFE interpolation to target FPS. "
             "Step 4: Real-ESRGAN upscale to 8K. "
-            "Step 5: FFmpeg assembly + verification."
+            "Step 5: FFmpeg assembly + verification. "
+            "Step 6: Safe cleanup of temporary data."
         )
     )
     # Input selection.
@@ -61,11 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Step range.
     parser.add_argument(
-        "--from-step", type=int, default=1, choices=[1, 2, 3, 4, 5],
+        "--from-step", type=int, default=1, choices=[1, 2, 3, 4, 5, 6],
         help="First step to run (default: 1; >1 needs --config).",
     )
     parser.add_argument(
-        "--to-step", type=int, default=2, choices=[1, 2, 3, 4, 5],
+        "--to-step", type=int, default=2, choices=[1, 2, 3, 4, 5, 6],
         help="Last step to run (default: 2).",
     )
     parser.add_argument(
@@ -200,6 +202,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-verify", action="store_true",
         help="Skip output resolution/FPS verification.",
     )
+    # Step 6 options.
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Step 6: report what would be deleted without deleting.",
+    )
+    parser.add_argument(
+        "--keep-raw", action="store_true", help="Step 6: keep temp_raw_frames.",
+    )
+    parser.add_argument(
+        "--keep-interpolated", action="store_true",
+        help="Step 6: keep interpolated_720p.",
+    )
+    parser.add_argument(
+        "--keep-upscaled", action="store_true", help="Step 6: keep upscaled_8k.",
+    )
+    parser.add_argument(
+        "--keep-audio", action="store_true",
+        help="Step 6: keep the extracted audio file.",
+    )
     return parser
 
 
@@ -283,6 +304,16 @@ def main(argv: list[str] | None = None) -> int:
                 encoder_preset=args.encoder_preset,
                 ffmpeg_args=args.ffmpeg_args,
                 verify=not args.skip_verify,
+                logger=log,
+            ).run(config)
+
+        if args.from_step <= 6 <= args.to_step:
+            Step06Cleanup(
+                dry_run=args.dry_run,
+                keep_raw=args.keep_raw,
+                keep_interpolated=args.keep_interpolated,
+                keep_upscaled=args.keep_upscaled,
+                keep_audio=args.keep_audio,
                 logger=log,
             ).run(config)
     except InputVideoNotFoundError as exc:

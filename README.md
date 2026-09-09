@@ -12,7 +12,7 @@
 | Step 3 | RIFE interpolasiyası (→1000 FPS, 2^N + resample) | ✅ hazır |
 | Step 4 | Real-ESRGAN 8K upscale (tiled, async I/O) | ✅ hazır |
 | Step 5 | FFmpeg yığma + audio mux + verifikasiya | ✅ hazır |
-| Step 6 | Resurs təmizliyi və müvəqqəti fayllar | ⏳ növbəti |
+| Step 6 | Resurs təmizliyi və müvəqqəti fayllar | ✅ hazır |
 | Step 4 | Super-rezolusiya (→8K, tiled inference) | ⬜ |
 | Step 5 | Denoise / deblur / rəng bərpası | ⬜ |
 | Step 6 | Kadrların keyfiyyət yoxlaması və filtrasiyası | ⬜ |
@@ -330,6 +330,49 @@ result = Step05Assemble(video_codec="auto", crf=19).run(config)
 print(result.output_path, result.verified)  # final video + True
 ```
 
+## Step 6 — Təhlükəsiz Təmizlik (müvəqqəti kadrlar)
+
+Step 5 final `final_8k_1000fps.mp4`-i yaratdıqdan sonra yüzlərlə GB
+müvəqqəti məlumat təhlükəsiz silinir:
+
+1. **Təhlükəsizlik qapısı** — final video mövcud və **boş deyilsə** davam
+   edir; yoxdursa `CleanupSafetyError` ilə **imtina** edir və heç nə silmir.
+2. **Silmə** — `temp_raw_frames`, `interpolated_720p`, `upscaled_8k` və
+   çıxarılmış WAV `shutil.rmtree` ilə silinir (`onexc` + köhnə Python üçün
+   `onerror` fallback); azad olunan yer loglanır:
+   `Cleaned up 142.5 GB of temporary frame data.`
+3. **Workspace həbsi** — yalnız `workspace_root` **içindəki** yollar
+   silinə bilər (kənardakı audio faylı həmişə saxlanılır).
+4. **Xəta tolerantlığı** — kilidli/uğursuz fayllar toplanıb xəbərdarlıq
+   verilir, icra yarımçıq qalmır; `--dry-run` silmədən önizləyir;
+   `--keep-raw`, `--keep-interpolated`, `--keep-upscaled`, `--keep-audio`
+   kateqoriyaları qoruyur.
+5. **Step 7-ə hazırlıq** — final video, `config.json` və loglar saxlanılır;
+   `cleanup_completed`/`cleanup_freed_bytes` konfiqə yazılır.
+
+```bash
+# Yalnız Step 6 (saxlanmış konfiqdən):
+python main.py --config workspace/config.json --from-step 6 --to-step 6
+
+# Əvvəlcə önizlə, sonra sil:
+python main.py --config workspace/config.json --from-step 6 --to-step 6 --dry-run
+
+# 8K kadrları saxla, qalanını sil:
+python main.py --config workspace/config.json --from-step 6 --to-step 6 --keep-upscaled
+```
+
+### Proqramlı istifadə (Step 6)
+
+```python
+from pipeline.config import PipelineConfig
+from pipeline.step06_cleanup import Step06Cleanup
+
+config = PipelineConfig.load("workspace/config.json")
+result = Step06Cleanup(dry_run=False).run(config)
+
+print(result.freed_gb, result.failed)  # məs: 142.5 []
+```
+
 ### Layihə strukturu
 
 ```text
@@ -347,6 +390,7 @@ print(result.output_path, result.verified)  # final video + True
 │   ├── step03_interpolate.py    # STEP 3: 2^N subdivision + resample orkestri
 │   ├── step04_upscale.py        # STEP 4: 8K upscale orkestri (async yazı ilə)
 │   ├── step05_assemble.py       # STEP 5: FFmpeg yığma + audio + verifikasiya
+│   ├── step06_cleanup.py        # STEP 6: təhlükəsiz müvəqqəti-məlumat təmizliyi
 │   ├── frame_io.py              # paylaşılan kadr oxuma/yazma (OpenCV)
 │   ├── rife/
 │   │   ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
@@ -364,7 +408,8 @@ print(result.output_path, result.verified)  # final video + True
     ├── test_step02_frames.py
     ├── test_step03_interpolate.py
     ├── test_step04_upscale.py
-    └── test_step05_assemble.py
+    ├── test_step05_assemble.py
+    └── test_step06_cleanup.py
 ```
 
 ### Testlər

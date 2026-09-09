@@ -97,6 +97,11 @@ class PipelineConfig:
     assembly_verified: Optional[bool] = None      # ffprobe/cv2 check passed
     assembly_file_size_mb: Optional[float] = None
 
+    # -- Cleanup (filled in by Step 6) ---------------------------------------
+    cleanup_completed: Optional[bool] = None      # temp data purged
+    cleanup_freed_bytes: Optional[int] = None     # disk space reclaimed
+    cleanup_failed_count: Optional[int] = None    # files that could not be deleted
+
     def __post_init__(self) -> None:
         # Accept plain strings for convenience.
         self.input_video_path = Path(self.input_video_path)
@@ -259,5 +264,22 @@ class PipelineConfig:
                 else f"  assembly (Step 5)  : {self.assembly_codec}, "
                 f"{self.assembled_frame_count} frames, "
                 f"verified={'yes' if self.assembly_verified else 'NO'}"
+            )
+        # Step 6 section (only once Step 6 has run).
+        if self.cleanup_completed is not None:
+            freed = (
+                f"{self.cleanup_freed_bytes / (1024 ** 3):.2f} GB"
+                if self.cleanup_freed_bytes
+                else "0 B"
+            )
+            lines.append(
+                f"  cleanup (Step 6)   : "
+                f"{'done' if self.cleanup_completed else 'SKIPPED'}, "
+                f"freed {freed}"
+                + (
+                    f", {self.cleanup_failed_count} undeleted"
+                    if self.cleanup_failed_count
+                    else ""
+                )
             )
         return "\n".join(lines)
