@@ -313,10 +313,12 @@ def create_app():
     return demo
 
 
-def launch_ui(port: int = 7860, share: bool = False) -> None:
+def launch_ui(port: int = 7860, share: bool = False, inbrowser: bool = False) -> None:
     """Launch the WebUI server (blocks until interrupted)."""
     demo = create_app()
-    demo.queue().launch(server_name="0.0.0.0", server_port=port, share=share)
+    demo.queue().launch(
+        server_name="0.0.0.0", server_port=port, share=share, inbrowser=inbrowser
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> int:

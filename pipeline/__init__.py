@@ -7,8 +7,9 @@ and frame extraction) consumes the config; Step 3 (RIFE interpolation to
 the interpolated frames; Step 5 (FFmpeg assembly + verification) produces the
 final video; Step 6 (safe cleanup) reclaims workspace disk space; Step 7
 (checkpoint & resume) makes every run crash-proof; Step 8 (CLI shortcuts +
-Gradio WebUI backend) makes every run one click away; later steps build on
-all of them.
+Gradio WebUI backend) makes every run one click away; Step 9 (GPU
+acceleration + profiling) makes every run fast; Step 10 (packaging) ships
+every run as a standalone app.
 """
 
 from pipeline.checkpoint import (
@@ -26,7 +27,7 @@ from pipeline.step05_assemble import Step05Assemble, Step05Result
 from pipeline.step06_cleanup import Step06Cleanup, Step06Result
 from pipeline.webui import ProgressBus, RunOptions, parse_resolution
 
-__version__ = "0.8.0"  # Steps 1-8 complete
+__version__ = "1.0.0"  # Steps 1-10 complete: first commercial-grade release
 __all__ = [
     "CheckpointManager",
     "PipelineConfig",

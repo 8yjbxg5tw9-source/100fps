@@ -29,6 +29,7 @@ from typing import Dict, Optional
 
 from pipeline.exceptions import RifeWeightsError
 from pipeline.logger import get_logger
+from pipeline.weights_manifest import verify_against_manifest
 
 WEIGHTS_DIRNAME = "weights"
 RIFE_WEIGHTS_SUBDIR = "rife"
@@ -107,14 +108,22 @@ def ensure_weights(
     info = RIFE_VERSIONS[version]
     cached = cache_path(weights_root, version)
     if cached.is_file() and cached.stat().st_size > 0:
-        log.info("Using cached RIFE v%s weights: %s", version, cached)
-        return cached
+        if _manifest_ok(cached, weights_root, log):
+            log.info("Using cached RIFE v%s weights: %s", version, cached)
+            return cached
+        # Tampered cache was unlinked inside _manifest_ok — re-download below.
 
     log.info("Downloading RIFE v%s weights (%s) ...", version, info.description)
     cached.parent.mkdir(parents=True, exist_ok=True)
     try:
         _download_drive_file(info.drive_id, cached, log, desc=f"rife{version}")
         _finalize_download(cached, info, log)
+        if verify_against_manifest(cached, weights_root) is False:
+            raise RifeWeightsError(
+                f"Downloaded RIFE v{version} weights failed the SHA-256 "
+                f"manifest check — refusing to use them. Refresh the manifest "
+                f"with packaging/fetch_weights.py."
+            )
     except RifeWeightsError:
         _silent_unlink(cached)
         raise
@@ -207,6 +216,19 @@ def _progress_bar(total: Optional[int], desc: str, log: logging.Logger) -> objec
                 pass
 
         return _Null()
+
+
+def _manifest_ok(cached: Path, weights_root: str | Path, log: logging.Logger) -> bool:
+    """Manifest check on a cache hit (missing manifest = legacy OK)."""
+    if verify_against_manifest(cached, weights_root) is False:
+        log.warning(
+            "Cached %s failed its SHA-256 manifest check (corrupt/tampered?) "
+            "-- re-downloading ...",
+            cached,
+        )
+        _silent_unlink(cached)
+        return False
+    return True
 
 
 # -- Post-download handling ------------------------------------------------------

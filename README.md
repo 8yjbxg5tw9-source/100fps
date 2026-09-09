@@ -16,7 +16,57 @@
 | Step 7 | Checkpoint & resume (çökmədən bərpa) | ✅ hazır |
 | Step 8 | CLI qısayolları + Gradio WebUI | ✅ hazır |
 | Step 9 | GPU sürətləndirmə + profilləmə (ONNX/TensorRT, FP16/BF16, CUDA stream-lər, benchmark) | ✅ hazır |
-| Step 10 | Final inteqrasiya + sənədləşmə | ⬜ |
+| Step 10 | Müstəqil EXE/portable + installer + sənədləşmə | ✅ hazır |
+
+---
+
+## Quraşdırma və İstifadə (son istifadəçi üçün)
+
+Python və ya kitabxana quraşdırmağa ehtiyac yoxdur — hazır buraxılışı
+endirin, açın, işlədin.
+
+**Variant A — Windows installer (tövsiyə olunur):**
+
+1. `100fps-<versiya>-win64-setup.exe`-ni işə salın (admin hüququ lazım
+   deyil — proqram `%LOCALAPPDATA%\100fps`-ə, yəni yalnız sizin
+   profilinizə yazılır).
+2. Quraşdırıcı NVIDIA drayverini yoxlayır: drayver yoxdursa xəbərdarlıq
+   çıxır (CPU rejimində 8K emalı saatlarla çəkir — drayveri yeniləyin).
+3. Start menyusundakı **100fps** qısayoluna klikləyin → brauzerdə GUI
+   açılır → videonu sürükləyib buraxın → **Emalı başlat**.
+4. Silmək üçün: Start menyusu → **Uninstall 100fps** (endirilmiş AI
+   modelləri və workspace-ləriniz saxlanılır).
+
+**Variant B — portable ZIP (Windows/Linux):**
+
+1. `100fps-<versiya>-<win64|linux>.zip`-i yazma icazəsi olan qovluğa açın.
+2. GUI: `100fps-gui` (`.exe` Windows-da) — iki klik, brauzer açılır.
+   CLI: `100fps --input video/in.mp4 --output video/out.mp4 --to-step 5`
+   (`--help` bütün seçimləri göstərir).
+3. Köçürmək/silmək üçün qovluğu silmək kifayətdir.
+
+**İlk işədüşmə:** AI çəkiləri (~130 MB: RIFE v4 + Real-ESRGAN x4plus)
+ilk dəfə lazım olanda rəsmi mənbələrdən avtomatik endirilir (tərəqqi
+zolağı ilə) və `models/` qovluğuna yazılır; hər fayl SHA-256 manifestlə
+yoxlanılır (xarab/pozulmuş fayl avtomatik yenidən endirilir). İnternetsiz
+maşın üçün çəkiləri əvvəlcədən yükləyib `models/`-a yerləşdirin
+(tərtibatçı: `python packaging/fetch_weights.py --out models`).
+
+## Aparat tələbləri
+
+| Resurs | Minimal (işləyir, yavaş) | Tövsiyə (8K real vaxta yaxın) |
+|--------|--------------------------|-------------------------------|
+| GPU | İstənilən (CPU rejimi) | NVIDIA RTX, **12+ GB VRAM** (24 GB ideal) |
+| CPU | 8 nüvə | 12+ nüvə (NVENC encode üçün) |
+| RAM | 16 GB | 32–64 GB (8K PNG kadrlar RAM-i tez doldurur) |
+| Disk | 50 GB boş | 200+ GB NVMe SSD |
+| OS | Windows 10+ x64 / Linux x64 | eyni + son NVIDIA Studio drayveri |
+| Şəbəkə | İlk işədüşmədə ~130 MB | eyni |
+
+Niyə bu qədər disk? 8K PNG kadr ~20–50 MB-dır; 1000 FPS o deməkdir ki,
+hər saniyə video minlərlə kadr yaradır. 10 saniyəlik klip asanlıqla
+100+ GB workspace istəyir. Bitdikdən sonra Step 6 (`--to-step 6` və ya
+UI-də "Sonda təmizlə") aralıq kadrları silir.
 
 ---
 
@@ -543,14 +593,99 @@ report.save("workspace/benchmark.json")
 print(report.render_text())
 ```
 
+## Step 10 — Müstəqil EXE + Installer (paketləmə)
+
+Texniki biliyi olmayan istifadəçi belə bir kliklə işlətməlidir — Step 10
+bütün pipeline-ı (Python, torch/CUDA DLL-ləri, OpenCV, FFmpeg, GUI)
+**tək buraxılışa** qablaşdırır:
+
+1. **PyInstaller build** — `python packaging/build.py` bir əmrlə portable
+   qovluq + ZIP yaradır: `100fps` (konsol CLI) və `100fps-gui` (pəncərəsiz
+   GUI launcher) eyni bundle-ı paylaşır; `packaging/100fps.spec`
+   torch/CUDA DLL-lərini, gradio-nu və `bin/ffmpeg`+`ffprobe`-u toplayır.
+   Olmayan asılılıqlar xəbərdarlıqla keçilir (smoke build hətta boş
+   maşında alınır), `--target onefile` tək CLI exe verir.
+2. **Daxili resurslar** — `pipeline/resources.py` frozen rejimi tanıyır:
+   `bin/` avtomatik `PATH`-a əlavə olunur (sistem FFmpeg-i lazım deyil),
+   çəkilər exe-nin yanındakı yazıla-bilən `models/`-a düşür (onefile
+   temp-ə yox!). Arqumentsiz iki klik GUI-ni açır (`main.py` frozen
+   hook-u + `--version`).
+3. **Çəki idarəetməsi** — ilk işədüşmədə rəsmi mənbələrdən auto-yükləmə
+   (tərəqqi zolağı var idi, Step 10 SHA-256 manifesti əlavə etdi:
+   `pipeline/weights_manifest.py` hər faylı yoxlayır, pozulmuşu silib
+   yenidən endirir). Offline installer üçün:
+   `python packaging/fetch_weights.py --out packaging/vendor/models`
+   (+ `--weights download` ilə build-ə gömülür).
+4. **Windows installer** — `packaging/innosetup/100fps.iss` (Inno Setup 6):
+   per-user quraşdırma (admin lazım deyil), Desktop + Start menyu
+   qısayolları, quraşdırmada NVIDIA/drayver xəbərdarlığı, standart
+   Uninstaller (modellər və workspace-lər saxlanılır). Versiya
+   `pipeline.__version__` ilə testdə kilidlənib.
+5. **Kross-platforma** — eyni spec Windows/Linux-da işləyir (həmişə hədəf
+   OS-də build edin!); macOS üçün `.app` BUNDLE stanzası hazırdır
+   (codesign/notarizasiya Apple hesabı tələb edir — sınaqdan keçməyib).
+
+```bash
+# Tam buraxılış (GPU maşında: torch + gradio quraşdırıb):
+pip install -r requirements.txt -r requirements-ui.txt
+python packaging/build.py --weights download
+# → packaging/dist/100fps/  +  100fps-1.0.0-win64.zip
+
+# Windows installer (Inno Setup 6 quraşdırıb):
+iscc packaging\innosetup\100fps.iss
+# → packaging\dist\installer\100fps-1.0.0-win64-setup.exe
+
+# Yalnız CLI, tək fayl / offline ffmpeg:
+python packaging/build.py --target onefile
+python packaging/build.py --ffmpeg local --ffmpeg-local /usr/bin
+```
+
+### Proqramlı istifadə (Step 10)
+
+```python
+from pipeline.resources import (
+    default_weights_root, find_ffmpeg, is_frozen, prepare_frozen_environment,
+)
+
+prepare_frozen_environment()  # dev-də no-op, frozen-da PATH/DLL hazırlığı
+print(is_frozen(), find_ffmpeg(), default_weights_root())
+# True  C:\...\100fps\bin\ffmpeg.exe  C:\...\100fps\models   (frozen)
+# False /usr/bin/ffmpeg               weights                 (dev)
+```
+
+## Problem həlli (Troubleshooting)
+
+| Simptom | Səbəb / Həll |
+|---------|--------------|
+| Quraşdırıcı "NVIDIA drayver tapılmadı" deyir | Drayver köhnə/yoxdur. NVIDIA saytından son Studio (tövsiyə) və ya Game Ready drayveri qurun, sonra davam edin. CPU rejimi 8K üçün yararsız dərəcədə yavaşdır. |
+| `CUDA out of memory` | Proqram tile/batch-i avtomatik kiçildir və təkrarlayır. Yenə alınmırsa: `--tile-size 256 --upscale-tile 256 --batch-size 1`, brauzer/oyunları bağlayın, `--precision fp16` (standartdır). |
+| `torch.cuda.is_available() is False` (GPU var) | CPU-lu torch qurulub. CUDA uyğun wheel lazımdır: pytorch.org-dan `cu121/cu124` build-i (`pip install torch --index-url ...`). Frozen buraxılışda bu problem yoxdur (build maşının torch-u gömülür). |
+| FFmpeg tapılmadı | Frozen-da `bin/` avtomatik əlavə olunur — olubsa antivirus silib (istisnaya əlavə edin). Dev-də: `ffmpeg` PATH-da olmalıdır (`choco install ffmpeg` / `apt install ffmpeg`). |
+| Google Drive çəki endirmir ("quota/block") | Drive gündəlik limit qoyur. Bir neçə saat gözləyin və ya linkdən əl ilə endirib `--weights flownet.pkl` / `--esrgan-weights x.pth` ilə göstərin. |
+| `SHA-256 manifest check failed` | Çəki faylı yarımçıq/pozulub. Proqram avtomatik yenidən endirir; təkrarlanırsa `models/` (dev-də `weights/`) qovluğunu silib təkrarlayın. |
+| Antivirus `.exe`-ni karantinə alır | İmzasız PyInstaller binarları bəzən false-positive verir. Qovluğu istisnaya əlavə edin və ya mənbədən (`python main.py`) işlədin. Kommersiya yayımı üçün kod-imza (codesign) sertifikatı alın. |
+| Windows-da "yol çox uzundur" / yazma xətası | Layihəni `C:\100fps\` kimi qısa yola açın; OneDrive/Desktop sync qovluğunda işlətməyin. |
+| GUI brauzeri açmır | Konsolda göstərilən `http://127.0.0.1:7860` ünvanını əl ilə açın; port məşğuldursa `--ui-port 7861`. |
+| Hər şey yavaşdır | `--profile` ilə benchmark-a baxın: `io_write` üstünlük təşkil edirsə SSD-yə keçin; `inference`dirsə GPU/precision/ONNX-a baxın (Step 9). |
+
 ### Layihə strukturu
 
 ```text
 100fps/
-├── main.py                      # CLI giriş nöqtəsi (--from-step/--to-step)
+├── main.py                      # CLI giriş nöqtəsi (--from-step/--to-step, --ui)
 ├── app.py                       # STEP 8: Gradio WebUI (python app.py / --ui)
 ├── requirements.txt             # Python asılılıqları
 ├── requirements-ui.txt          # WebUI üçün əlavə (gradio)
+├── packaging/                   # STEP 10: standalone build
+│   ├── build.py                 #   bir əmrli builder (portable + ZIP + smoke)
+│   ├── 100fps.spec              #   PyInstaller spec (CLI + GUI, defensiv)
+│   ├── fetch_ffmpeg.py          #   statik ffmpeg/ffprobe tədarükü
+│   ├── fetch_weights.py         #   çəki pre-download + manifest yazıcı
+│   ├── gui_launcher.py          #   pəncərəsiz GUI entry (100fps-gui)
+│   ├── assets/                  #   icon.png/.ico + make_icon.py generatoru
+│   ├── innosetup/100fps.iss     #   Windows installer (per-user, CUDA check)
+│   ├── dist-readme.txt          #   portable README.txt mənbəyi
+│   └── THIRD_PARTY_LICENSES.txt #   komponent lisenziyaları
 ├── pipeline/
 │   ├── __init__.py
 │   ├── base.py                  # PipelineStep abstrakt bazası (bütün 10 addım üçün)
@@ -566,6 +701,8 @@ print(report.render_text())
 │   ├── checkpoint.py            # STEP 7: pipeline_state.json + resume + OOM bərpası
 │   ├── webui.py                 # STEP 8: RunOptions + ProgressBus + fon-runner
 │   ├── perf.py                  # STEP 9: Profiler + ring writer + VRAM + benchmark
+│   ├── resources.py             # STEP 10: frozen/dev resurs həlli (bin/, models/)
+│   ├── weights_manifest.py      # STEP 10: çəki SHA-256 manifesti + verify
 │   ├── frame_io.py              # paylaşılan kadr oxuma/yazma (OpenCV)
 │   ├── rife/
 │   │   ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
@@ -588,7 +725,8 @@ print(report.render_text())
     ├── test_step06_cleanup.py
     ├── test_step07_checkpoint.py
     ├── test_step08_webui.py
-    └── test_step09_perf.py
+    ├── test_step09_perf.py
+    └── test_step10_packaging.py
 ```
 
 ### Testlər

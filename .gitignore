@@ -18,3 +18,8 @@ venv/
 # Test / OS noise
 .pytest_cache/
 .DS_Store
+
+# Step 10: packaging artefacts (huge, reproducible — never commit)
+packaging/vendor/
+packaging/dist/
+packaging/build/

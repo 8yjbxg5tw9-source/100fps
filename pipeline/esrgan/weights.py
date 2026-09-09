@@ -22,6 +22,7 @@ from typing import Dict, Optional
 
 from pipeline.exceptions import EsrganWeightsError
 from pipeline.logger import get_logger
+from pipeline.weights_manifest import verify_against_manifest
 
 WEIGHTS_DIRNAME = "weights"
 ESRGAN_WEIGHTS_SUBDIR = "esrgan"
@@ -94,14 +95,22 @@ def ensure_esrgan_weights(
     info = ESRGAN_MODELS[model]
     cached = cache_path(weights_root, model)
     if cached.is_file() and cached.stat().st_size > _MIN_WEIGHT_BYTES:
-        log.info("Using cached Real-ESRGAN %s weights: %s", model, cached)
-        return cached
+        if _manifest_ok(cached, weights_root, log):
+            log.info("Using cached Real-ESRGAN %s weights: %s", model, cached)
+            return cached
+        # Tampered cache was unlinked inside _manifest_ok — re-download below.
 
     log.info("Downloading Real-ESRGAN %s weights (%s) ...", model, info.description)
     cached.parent.mkdir(parents=True, exist_ok=True)
     try:
         _download(info.url, cached, log, desc=info.filename)
         _validate(cached, info)
+        if verify_against_manifest(cached, weights_root) is False:
+            raise EsrganWeightsError(
+                f"Downloaded {info.filename} failed the SHA-256 manifest "
+                f"check — refusing to use it. Refresh the manifest with "
+                f"packaging/fetch_weights.py."
+            )
     except EsrganWeightsError:
         _silent_unlink(cached)
         raise
@@ -149,6 +158,19 @@ def _download(url: str, dest: Path, log: logging.Logger, desc: str) -> None:
             response.close()
         except Exception:  # noqa: BLE001 - best effort
             pass
+
+
+def _manifest_ok(cached: Path, weights_root: str | Path, log: logging.Logger) -> bool:
+    """Manifest check on a cache hit (missing manifest = legacy OK)."""
+    if verify_against_manifest(cached, weights_root) is False:
+        log.warning(
+            "Cached %s failed its SHA-256 manifest check (corrupt/tampered?) "
+            "-- re-downloading ...",
+            cached,
+        )
+        _silent_unlink(cached)
+        return False
+    return True
 
 
 def _validate(path: Path, info: EsrganModelInfo) -> None:

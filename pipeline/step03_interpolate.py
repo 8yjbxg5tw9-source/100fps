@@ -59,6 +59,7 @@ from pipeline.config import (
 from pipeline.exceptions import InterpolationError
 from pipeline.logger import get_logger
 from pipeline.perf import RingBufferWriter
+from pipeline.resources import default_weights_root
 
 if TYPE_CHECKING:
     from pipeline.checkpoint import CheckpointManager
@@ -105,7 +106,7 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         backend: str = "rife",           # "rife" (AI) | "blend" (smoke test)
         rife_version: str = "4",
         weights: Optional[str | Path] = None,
-        weights_root: str | Path = "weights",
+        weights_root: Optional[str | Path] = None,  # None -> default_weights_root()
         device: Optional[str] = None,    # "cuda" | "cpu" | None (auto)
         fp16: Optional[bool] = None,     # None -> auto (True on CUDA)
         batch_size: int = 4,             # pairs per GPU forward batch
@@ -140,7 +141,12 @@ class Step03Interpolate(PipelineStep[Step03Result]):
         self.backend_name = backend
         self.rife_version = rife_version
         self.weights = weights
-        self.weights_root = weights_root
+        # str(): ckpt_params (JSON) must stay serialisable; frozen builds
+        # resolve to <exe-dir>/models, dev runs keep "weights".
+        self.weights_root = (
+            weights_root if weights_root is not None
+            else str(default_weights_root())
+        )
         self.device = device
         self.fp16 = fp16
         self.batch_size = batch_size

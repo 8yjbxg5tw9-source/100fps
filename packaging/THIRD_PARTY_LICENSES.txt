@@ -1,0 +1,43 @@
+100fps — Third-party components (Step 10)
+=========================================
+This bundle contains FREE and OPEN-SOURCE software. Each component keeps
+its own license; full license texts live in the source tree
+(pipeline/*/vendor/) and at the upstream links below.
+
+AI MODELS / CODE (vendored under pipeline/)
+  RIFE (ECCV 2022, hzwer/ECCV2022-RIFE) ............ MIT License
+    Code: pipeline/rife/vendor/ (+ VENDOR.md). Weights (.pkl) are
+    downloaded from the official/community links at first run.
+  Real-ESRGAN (xinntao/Real-ESRGAN, BasicSR) ....... BSD-3-Clause / Apache-2.0
+    Code: pipeline/esrgan/vendor/ (+ docs). Weights (.pth) are downloaded
+    from the official v0.1.0 GitHub release at first run.
+
+RUNTIME LIBRARIES (bundled binary wheels)
+  Python ......................... Python Software Foundation License
+    https://docs.python.org/3/license.html
+  PyTorch + torchvision .......... BSD-style (see pytorch.org)
+    https://github.com/pytorch/pytorch/blob/main/LICENSE
+  OpenCV (opencv-python) ......... Apache-2.0
+  NumPy .......................... BSD-3-Clause
+  Pillow ......................... HPND (PIL Software License)
+  tqdm ........................... MPL-2.0 / MIT
+  Gradio (GUI only) .............. Apache-2.0
+  onnxruntime (optional) ......... MIT
+  onnx (optional, export only) ... Apache-2.0
+
+VIDEO TOOLING (bundled binaries in bin/)
+  FFmpeg + FFprobe ................. GPL v2+/LGPL v2.1+ (build-dependent)
+    Windows static build: https://www.gyan.dev/ffmpeg/builds/
+    Linux static build:   https://johnvansickle.com/ffmpeg/
+    macOS static build:   https://evermeet.cx/ffmpeg/
+    See https://ffmpeg.org/legal.html. If you redistribute this bundle
+    commercially, verify the exact license of the FFmpeg build inside
+    (run: bin/ffmpeg -buildconf) and comply with it.
+
+PACKAGING TOOLS (used at build time, NOT shipped)
+  PyInstaller .................... GPL v2+ with bootloader exception
+    (exception allows shipping proprietary apps; see PyInstaller LICENSE)
+  Inno Setup ..................... BSD-style (jrsoftware.org/isinfo.php)
+
+100fps's own pipeline code was written for this project; vendor dirs above
+carry their original copyrights. No warranty — see the project README.

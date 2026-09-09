@@ -25,6 +25,7 @@ from typing import List, Optional
 from pipeline.exceptions import RifeInferenceError
 from pipeline.logger import get_logger
 from pipeline.perf import resolve_torch_precision
+from pipeline.resources import default_weights_root
 from pipeline.rife.weights import (
     DEFAULT_RIFE_VERSION,
     WEIGHTS_DIRNAME,
@@ -75,7 +76,7 @@ class TorchRifeBackend(RifeBackend):
         self,
         version: str = DEFAULT_RIFE_VERSION,
         weights: Optional[str | Path] = None,
-        weights_root: str | Path = WEIGHTS_DIRNAME,
+        weights_root: Optional[str | Path] = None,  # None -> default_weights_root()
         device: Optional[str] = None,  # "cuda" | "cpu" | None (auto)
         fp16: Optional[bool] = None,  # None -> True on CUDA, False on CPU
         precision: Optional[str] = None,  # Step 9: auto|fp32|fp16|bf16 (beats fp16)
@@ -121,9 +122,14 @@ class TorchRifeBackend(RifeBackend):
         )
         self.fp16 = self.dtype_name == "fp16"
         self._stream = self._make_stream(torch)
+        weights_root = (
+            self.weights_root
+            if self.weights_root is not None
+            else default_weights_root()
+        )
         self.weights_path = ensure_weights(
             version=self.version,
-            weights_root=self.weights_root,
+            weights_root=weights_root,
             weights_override=self.weights,
             logger=self.log,
         )

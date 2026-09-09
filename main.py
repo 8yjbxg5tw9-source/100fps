@@ -24,6 +24,7 @@ import sys
 import time
 from pathlib import Path
 
+from pipeline import __version__
 from pipeline.checkpoint import CheckpointManager, steps_to_run
 from pipeline.config import TARGET_FPS, TARGET_HEIGHT, TARGET_WIDTH, PipelineConfig
 from pipeline.exceptions import (
@@ -32,6 +33,7 @@ from pipeline.exceptions import (
 )
 from pipeline.logger import get_logger
 from pipeline.perf import Profiler, VramSampler, nvidia_smi_probe
+from pipeline.resources import is_frozen, prepare_frozen_environment
 from pipeline.webui import parse_resolution, parse_tile_size
 from pipeline.esrgan.weights import DEFAULT_ESRGAN_MODEL, ESRGAN_MODELS
 from pipeline.rife.weights import DEFAULT_RIFE_VERSION, RIFE_VERSIONS
@@ -62,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     # WebUI launcher (Step 8).
+    parser.add_argument(
+        "--version", action="version",
+        version=f"%(prog)s {__version__} (720p -> 8K @ 1000 FPS pipeline)",
+    )
     parser.add_argument(
         "--ui", action="store_true",
         help="Launch the Gradio WebUI instead of running the CLI pipeline.",
@@ -343,6 +349,13 @@ def _save_and_print_benchmark(
 
 
 def main(argv: list[str] | None = None) -> int:
+    prepare_frozen_environment()  # no-op on dev runs; PATH/DLLs when frozen
+    if argv is None and is_frozen() and len(sys.argv) <= 1:
+        # Double-clicked EXE with no arguments: open the GUI, not an error.
+        import app
+
+        app.launch_ui(inbrowser=True)
+        return 0
     args = build_parser().parse_args(argv)
     if args.ui:
         import app

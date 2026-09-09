@@ -56,6 +56,7 @@ from pipeline.config import (
 )
 from pipeline.exceptions import UpscaleError
 from pipeline.logger import get_logger
+from pipeline.resources import default_weights_root
 
 if TYPE_CHECKING:
     from pipeline.checkpoint import CheckpointManager
@@ -88,7 +89,7 @@ class Step04Upscale(PipelineStep[Step04Result]):
         backend: str = "esrgan",          # "esrgan" (AI) | "onnx" (AI) | "resize" (smoke)
         model: str = "x4plus",            # "x4plus" | "x4plus-anime"
         weights: Optional[str | Path] = None,
-        weights_root: str | Path = "weights",
+        weights_root: Optional[str | Path] = None,  # None -> default_weights_root()
         device: Optional[str] = None,     # "cuda" | "cpu" | None (auto)
         fp16: Optional[bool] = None,      # None -> auto (True on CUDA)
         tile: Optional[int] = None,       # None -> config.tile_size; 0 = off
@@ -126,7 +127,12 @@ class Step04Upscale(PipelineStep[Step04Result]):
         self.backend_name = backend
         self.model_name = model
         self.weights = weights
-        self.weights_root = weights_root
+        # str(): ckpt_params (JSON) must stay serialisable; frozen builds
+        # resolve to <exe-dir>/models, dev runs keep "weights".
+        self.weights_root = (
+            weights_root if weights_root is not None
+            else str(default_weights_root())
+        )
         self.device = device
         self.fp16 = fp16
         self.tile = tile
