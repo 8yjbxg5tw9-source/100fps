@@ -11,7 +11,8 @@
 | Step 2 | Video analizi, audio çıxarılması, kadrlara bölünmə | ✅ hazır |
 | Step 3 | RIFE interpolasiyası (→1000 FPS, 2^N + resample) | ✅ hazır |
 | Step 4 | Real-ESRGAN 8K upscale (tiled, async I/O) | ✅ hazır |
-| Step 5 | Kadrların birləşdirilməsi və video eksportu | ⏳ növbəti |
+| Step 5 | FFmpeg yığma + audio mux + verifikasiya | ✅ hazır |
+| Step 6 | Resurs təmizliyi və müvəqqəti fayllar | ⏳ növbəti |
 | Step 4 | Super-rezolusiya (→8K, tiled inference) | ⬜ |
 | Step 5 | Denoise / deblur / rəng bərpası | ⬜ |
 | Step 6 | Kadrların keyfiyyət yoxlaması və filtrasiyası | ⬜ |
@@ -283,6 +284,52 @@ print(result.written_count, result.target_size)  # məs: 2000 (7680, 4320)
 print(result.out_dir)                            # Step 5-in giriş qovluğu
 ```
 
+## Step 5 — Video Yığma + Audio + Verifikasiya
+
+Step 4-ün 8K kadrları və Step 2-nin audiosu tək final videoya yığılır:
+
+1. **Dinamik komanda** — `frame_8k_%08d.*` girişi, dəqiq `-framerate 1000` +
+   `-r 1000`, audio varsa `-c:a copy` + dəqiq `-t` trim (səs yoxdursa xətasız
+   keçilir), MP4 üçün `+faststart`.
+2. **Kodek** — default HEVC: CUDA-da `hevc_nvenc -preset p6 -tune hq -rc vbr
+   -cq 19`, CPU-da `libx265 -crf 19 -preset medium`; AV1 seçimləri
+   (`av1_nvenc`, `libsvtav1`) də var. Həmişə `yuv420p`. Enkoder FFmpeg
+   build-də yoxlanılır, `auto` rejimdə fallback işləyir.
+3. **Streamed encode** — kadrlar diskdən axınla gəlir (RAM dolmur),
+   `-progress` çıxışı `tqdm` bar-a bağlanır.
+4. **Verifikasiya** — çıxış FFprobe (yoxdursa OpenCV) ilə yoxlanılır:
+   ölçü/FPS uyğunsuzluğu **xəta** verir, say/davamiyyət fərqi xəbərdarlıq.
+
+```bash
+# Tam zəncir 1→5:
+python main.py --input video/in.mp4 --output video/final_8k_1000fps.mp4 --to-step 5
+
+# Yalnız Step 5 (saxlanmış konfiqdən):
+python main.py --config workspace/config.json --from-step 5 --to-step 5
+
+# GPU enkoder + fərqli keyfiyyət:
+python main.py --to-step 5 ... --video-codec hevc_nvenc --crf 17
+
+# Köməkçi: --encoder-preset ultrafast, --ffmpeg-args "...", --skip-verify
+```
+
+> **RAM qeydi:** proqram 8K HEVC (libx265) üçün ≥8 GB sistem RAM-ı tövsiyə
+> edir — az RAM-da Step 5 əvvəlcədən xəbərdarlıq edir. Çarələr: GPU enkoderi
+> (`--video-codec hevc_nvenc`), `.mkv` çıxışı və ya lean x265:
+> `--ffmpeg-args "-x265-params pools=1:frame-threads=1:rc-lookahead=10"`.
+
+### Proqramlı istifadə (Step 5)
+
+```python
+from pipeline.config import PipelineConfig
+from pipeline.step05_assemble import Step05Assemble
+
+config = PipelineConfig.load("workspace/config.json")
+result = Step05Assemble(video_codec="auto", crf=19).run(config)
+
+print(result.output_path, result.verified)  # final video + True
+```
+
 ### Layihə strukturu
 
 ```text
@@ -299,6 +346,7 @@ print(result.out_dir)                            # Step 5-in giriş qovluğu
 │   ├── step02_frames.py         # STEP 2: analiz + audio + kadr çıxarılması
 │   ├── step03_interpolate.py    # STEP 3: 2^N subdivision + resample orkestri
 │   ├── step04_upscale.py        # STEP 4: 8K upscale orkestri (async yazı ilə)
+│   ├── step05_assemble.py       # STEP 5: FFmpeg yığma + audio + verifikasiya
 │   ├── frame_io.py              # paylaşılan kadr oxuma/yazma (OpenCV)
 │   ├── rife/
 │   │   ├── backends.py          # rife (PyTorch AI) / blend (smoke) backend-lər
@@ -315,7 +363,8 @@ print(result.out_dir)                            # Step 5-in giriş qovluğu
     ├── test_step01_environment.py
     ├── test_step02_frames.py
     ├── test_step03_interpolate.py
-    └── test_step04_upscale.py
+    ├── test_step04_upscale.py
+    └── test_step05_assemble.py
 ```
 
 ### Testlər

@@ -64,3 +64,11 @@ class EsrganWeightsError(PipelineError):
 
 class EsrganInferenceError(PipelineError):
     """Raised when the upscaling backend fails (no torch/CUDA, OOM, ...)."""
+
+
+class AssemblyError(PipelineError):
+    """Raised when Step 5 cannot assemble the video (no frames, bad encoder)."""
+
+
+class OutputVerificationError(PipelineError):
+    """Raised when the assembled video fails resolution/FPS verification."""

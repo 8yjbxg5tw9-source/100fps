@@ -91,6 +91,12 @@ class PipelineConfig:
     upscaled_frame_count: Optional[int] = None    # 8K frames written
     upscaled_frame_pattern: Optional[str] = None
 
+    # -- Assembly (filled in by Step 5) --------------------------------------
+    assembly_codec: Optional[str] = None          # encoder actually used
+    assembled_frame_count: Optional[int] = None   # frames encoded
+    assembly_verified: Optional[bool] = None      # ffprobe/cv2 check passed
+    assembly_file_size_mb: Optional[float] = None
+
     def __post_init__(self) -> None:
         # Accept plain strings for convenience.
         self.input_video_path = Path(self.input_video_path)
@@ -241,5 +247,17 @@ class PipelineConfig:
                 f"  upscale (Step 4)   : {self.esrgan_model} via {self.esrgan_backend}, "
                 f"tile={self.esrgan_tile}, "
                 f"{self.upscaled_frame_count} frames ({self.upscaled_frame_pattern})"
+            )
+        # Step 5 section (only once Step 5 has run).
+        if self.assembly_codec is not None:
+            lines.append(
+                f"  assembly (Step 5)  : {self.assembly_codec}, "
+                f"{self.assembled_frame_count} frames, "
+                f"{self.assembly_file_size_mb:.1f} MB, "
+                f"verified={'yes' if self.assembly_verified else 'NO'}"
+                if self.assembly_file_size_mb is not None
+                else f"  assembly (Step 5)  : {self.assembly_codec}, "
+                f"{self.assembled_frame_count} frames, "
+                f"verified={'yes' if self.assembly_verified else 'NO'}"
             )
         return "\n".join(lines)

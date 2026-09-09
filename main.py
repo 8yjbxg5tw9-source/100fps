@@ -7,6 +7,7 @@ Examples:
     python main.py --config workspace/config.json --from-step 2
     python main.py --config workspace/config.json --from-step 3 --to-step 3
     python main.py --input video/in.mp4 --output video/out.mp4 --to-step 4
+    python main.py --input video/in.mp4 --output video/out.mp4 --to-step 5
 
 Exit codes:
     0 — success
@@ -32,10 +33,11 @@ from pipeline.step01_environment import setup_environment
 from pipeline.step02_frames import Step02Frames
 from pipeline.step03_interpolate import Step03Interpolate
 from pipeline.step04_upscale import Step04Upscale
+from pipeline.step05_assemble import Step05Assemble
 
 log = get_logger("main")
 
-LAST_STEP = 4
+LAST_STEP = 5
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Step 1: environment check, GPU analysis, central config. "
             "Step 2: metadata probe, audio + frame extraction. "
             "Step 3: RIFE interpolation to target FPS. "
-            "Step 4: Real-ESRGAN upscale to 8K."
+            "Step 4: Real-ESRGAN upscale to 8K. "
+            "Step 5: FFmpeg assembly + verification."
         )
     )
     # Input selection.
@@ -58,11 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # Step range.
     parser.add_argument(
-        "--from-step", type=int, default=1, choices=[1, 2, 3, 4],
+        "--from-step", type=int, default=1, choices=[1, 2, 3, 4, 5],
         help="First step to run (default: 1; >1 needs --config).",
     )
     parser.add_argument(
-        "--to-step", type=int, default=2, choices=[1, 2, 3, 4],
+        "--to-step", type=int, default=2, choices=[1, 2, 3, 4, 5],
         help="Last step to run (default: 2).",
     )
     parser.add_argument(
@@ -174,6 +177,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--writer-queue", type=int, default=8,
         help="Async writer FIFO depth (default: 8).",
     )
+    # Step 5 options.
+    parser.add_argument(
+        "--video-codec",
+        choices=["auto", "hevc_nvenc", "libx265", "av1_nvenc", "libsvtav1"],
+        default="auto",
+        help="Output encoder: auto = hevc_nvenc on CUDA else libx265.",
+    )
+    parser.add_argument(
+        "--crf", type=float, default=19,
+        help="Quality factor 0..63, lower = better (default: 19).",
+    )
+    parser.add_argument(
+        "--encoder-preset", default=None,
+        help="Override the encoder preset (e.g. ultrafast, p7, 8).",
+    )
+    parser.add_argument(
+        "--ffmpeg-args", default=None,
+        help="Extra raw ffmpeg args, e.g. \"-x265-params log-level=error\".",
+    )
+    parser.add_argument(
+        "--skip-verify", action="store_true",
+        help="Skip output resolution/FPS verification.",
+    )
     return parser
 
 
@@ -247,6 +273,16 @@ def main(argv: list[str] | None = None) -> int:
                 output_format=args.upscale_format,
                 empty_cache_every=args.upscale_cache_every,
                 writer_queue=args.writer_queue,
+                logger=log,
+            ).run(config)
+
+        if args.from_step <= 5 <= args.to_step:
+            Step05Assemble(
+                video_codec=args.video_codec,
+                crf=args.crf,
+                encoder_preset=args.encoder_preset,
+                ffmpeg_args=args.ffmpeg_args,
+                verify=not args.skip_verify,
                 logger=log,
             ).run(config)
     except InputVideoNotFoundError as exc:
