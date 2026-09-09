@@ -1,0 +1,153 @@
+"""Central configuration object for the whole 10-step pipeline.
+
+:class:`PipelineConfig` is created by Step 1
+(:mod:`pipeline.step01_environment`) and then passed to every later step, so
+all steps agree on paths, target resolution/FPS and the VRAM-derived tiling
+parameter. It can be serialised to ``workspace/config.json`` for handoff
+between processes (e.g. Step 2 reading what Step 1 prepared).
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Pipeline-wide constants (targets of the full 10-step program)
+# ---------------------------------------------------------------------------
+TARGET_FPS: float = 1000.0
+TARGET_WIDTH: int = 7680   # 8K UHD width
+TARGET_HEIGHT: int = 4320  # 8K UHD height
+
+# Workspace sub-folders (relative to ``workspace_root``). Step 1 creates them,
+# later steps use them as fixed handoff points.
+DIR_RAW_FRAMES = "temp_raw_frames"    # Step 2 output: original frames from FFmpeg
+DIR_INTERPOLATED = "interpolated_720p"  # Step 3 output: e.g. 30fps -> 1000fps frames
+DIR_UPSCALED_8K = "upscaled_8k"       # Step 4 output: 8K frames ready for encode
+
+
+@dataclass
+class PipelineConfig:
+    """Single source of truth for paths, targets and hardware decisions."""
+
+    # -- Required paths ------------------------------------------------------
+    input_video_path: Path
+    final_output_path: Path
+
+    # -- Workspace -----------------------------------------------------------
+    workspace_root: Path = field(default=Path("workspace"))
+
+    # -- Global targets ------------------------------------------------------
+    target_fps: float = TARGET_FPS
+    target_width: int = TARGET_WIDTH
+    target_height: int = TARGET_HEIGHT
+
+    # -- Hardware-derived settings (filled in by Step 1) ---------------------
+    tile_size: int = 256          # VRAM-based tiling; see Step01Environment
+    device: str = "cpu"           # "cuda" or "cpu"
+    gpu_name: Optional[str] = None
+    vram_gb: Optional[float] = None
+    ffmpeg_path: Optional[str] = None
+    ffmpeg_available: bool = False
+    ffmpeg_version: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # Accept plain strings for convenience.
+        self.input_video_path = Path(self.input_video_path)
+        self.final_output_path = Path(self.final_output_path)
+        self.workspace_root = Path(self.workspace_root)
+
+        if self.target_fps <= 0:
+            raise ValueError(f"target_fps must be positive, got {self.target_fps}")
+        if self.target_width <= 0 or self.target_height <= 0:
+            raise ValueError(
+                f"target resolution must be positive, got "
+                f"{self.target_width}x{self.target_height}"
+            )
+        if self.tile_size <= 0:
+            raise ValueError(f"tile_size must be positive, got {self.tile_size}")
+        if self.device not in ("cuda", "cpu"):
+            raise ValueError(f"device must be 'cuda' or 'cpu', got {self.device!r}")
+
+    # -- Derived paths --------------------------------------------------------
+    @property
+    def temp_raw_frames(self) -> Path:
+        """Step 2 output / Step 3 input: original decoded frames."""
+        return self.workspace_root / DIR_RAW_FRAMES
+
+    @property
+    def interpolated_720p(self) -> Path:
+        """Step 3 output / Step 4 input: interpolated (1000 FPS) frames."""
+        return self.workspace_root / DIR_INTERPOLATED
+
+    @property
+    def upscaled_8k(self) -> Path:
+        """Step 4 output / Step 7 input: upscaled 8K frames."""
+        return self.workspace_root / DIR_UPSCALED_8K
+
+    @property
+    def target_resolution(self) -> Tuple[int, int]:
+        return (self.target_width, self.target_height)
+
+    @property
+    def target_resolution_str(self) -> str:
+        return f"{self.target_width}x{self.target_height}"
+
+    # -- Filesystem ------------------------------------------------------------
+    def ensure_directories(self, create_output_parent: bool = True) -> "PipelineConfig":
+        """Create workspace + temp folders (and output parent) if missing."""
+        for folder in (
+            self.workspace_root,
+            self.temp_raw_frames,
+            self.interpolated_720p,
+            self.upscaled_8k,
+        ):
+            folder.mkdir(parents=True, exist_ok=True)
+        if create_output_parent and self.final_output_path.parent != Path(""):
+            self.final_output_path.parent.mkdir(parents=True, exist_ok=True)
+        return self
+
+    # -- (De)serialisation ------------------------------------------------------
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        for key in ("input_video_path", "final_output_path", "workspace_root"):
+            data[key] = str(data[key])
+        return data
+
+    def save(self, path: str | Path) -> Path:
+        """Write config as JSON (used for Step 1 -> Step 2 handoff)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        return path
+
+    @classmethod
+    def load(cls, path: str | Path) -> "PipelineConfig":
+        """Read a config previously written with :meth:`save`."""
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls(**data)
+
+    # -- Pretty printing ---------------------------------------------------------
+    def summary(self) -> str:
+        lines = [
+            "PipelineConfig:",
+            f"  input_video_path : {self.input_video_path}",
+            f"  final_output_path: {self.final_output_path}",
+            f"  workspace_root   : {self.workspace_root}",
+            f"  temp_raw_frames  : {self.temp_raw_frames}",
+            f"  interpolated_720p: {self.interpolated_720p}",
+            f"  upscaled_8k      : {self.upscaled_8k}",
+            f"  target           : {self.target_resolution_str} @ {self.target_fps} FPS",
+            f"  device           : {self.device}"
+            + (f" ({self.gpu_name}, {self.vram_gb:.1f} GB VRAM)" if self.gpu_name else ""),
+            f"  tile_size        : {self.tile_size}",
+            f"  ffmpeg           : "
+            + (
+                f"{self.ffmpeg_version} ({self.ffmpeg_path})"
+                if self.ffmpeg_available
+                else "NOT FOUND"
+            ),
+        ]
+        return "\n".join(lines)
