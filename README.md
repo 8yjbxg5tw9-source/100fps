@@ -8,8 +8,8 @@
 | Addım | Adı | Status |
 |-------|-----|--------|
 | Step 1 | Sistem mühitinin inisializasiyası, avadanlıq analizi, mərkəzi konfiqurasiya | ✅ hazır |
-| Step 2 | FFmpeg ilə videonun kadrlara bölünməsi | ⏳ növbəti |
-| Step 3 | Optik axın / kadr interpolasiyası (→1000 FPS) | ⬜ |
+| Step 2 | Video analizi, audio çıxarılması, kadrlara bölünmə | ✅ hazır |
+| Step 3 | Optik axın / kadr interpolasiyası (→1000 FPS, RIFE) | ⏳ növbəti |
 | Step 4 | Super-rezolusiya (→8K, tiled inference) | ⬜ |
 | Step 5 | Denoise / deblur / rəng bərpası | ⬜ |
 | Step 6 | Kadrların keyfiyyət yoxlaması və filtrasiyası | ⬜ |
@@ -125,11 +125,61 @@ config = setup_environment(
 # config.tile_size   -> 256 / 512 / 1024
 ```
 
+## Step 2 — Video Analizi, Audio və Kadr Çıxarılması
+
+Step 1-dən gələn `config` obyektini qəbul edir və Step 3-ə (RIFE interpolasiyası)
+hazır vəziyyətə gətirir:
+
+1. **Meta-məlumatlar** — FFprobe (yoxdursa OpenCV fallback) ilə ölçü, orijinal
+   FPS, ümumi kadr sayı, müddət oxunur; 1000 FPS-ə çatmaq üçün artım əmsalı
+   hesablanır (məs: 30 → 1000 FPS = **33.33x**). Nəticə həm atribut, həm də
+   `metadata` dictionary kimi `config`-ə yazılır.
+2. **Audio** — səs treki itkisiz `workspace/input_audio.wav` kimi ayrılır
+   (`--audio-format aac` ilə AAC də olar). Səs yoxdursa log qeyd olunur və
+   xətasız davam edilir (Step 8 səssiz çıxış yaradacaq).
+3. **Kadrlar** — bütün kadrlar itkisiz `frame_%06d.png` formatında
+   `temp_raw_frames`-ə çıxarılır (`--image-format jpg` ilə kiçik həcm də olar),
+   proses `tqdm` progress bar ilə göstərilir.
+4. **Validasiya** — çıxarılan fayl sayı ilə orijinal kadr sayı müqayisə olunur;
+   uyğunsuzluq xəbərdarlıq verir (çökmür).
+
+```bash
+# Step 1 + Step 2 birlikdə:
+python main.py --input video/in.mp4 --output video/out.mp4
+
+# Yalnız Step 1 (mühit + konfiq):
+python main.py --input video/in.mp4 --output video/out.mp4 --step1-only
+
+# Saxlanmış konfiqdən Step 2-ni təkrar işə salmaq:
+python main.py --config workspace/config.json
+
+# JPG kadrlar + AAC səs (daha az disk yeri):
+python main.py --input video/in.mp4 --output video/out.mp4 \
+  --image-format jpg --audio-format aac
+```
+
+Exit kodları: `0` uğur, `1` video tapılmadı, `2` digər xəta,
+`3` FFmpeg tapılmadı (Step 2-dən etibarən məcburidir).
+
+### Proqramlı istifadə (Step 2)
+
+```python
+from pipeline.config import PipelineConfig
+from pipeline.step02_frames import Step02Frames
+
+config = PipelineConfig.load("workspace/config.json")
+result = Step02Frames(image_format="png", audio_format="wav").run(config)
+
+print(result.interpolation_factor)  # məs: 33.33
+print(result.frame_dir)             # Step 3-ün giriş qovluğu
+print(result.audio_path)            # Step 8-in istifadə edəcəyi səs (və ya None)
+```
+
 ### Layihə strukturu
 
 ```text
 100fps/
-├── main.py                      # CLI giriş nöqtəsi (Step 1-i işə salır)
+├── main.py                      # CLI giriş nöqtəsi (Step 1 + Step 2)
 ├── requirements.txt             # Python asılılıqları
 ├── pipeline/
 │   ├── __init__.py
@@ -137,9 +187,11 @@ config = setup_environment(
 │   ├── config.py                # PipelineConfig — mərkəzi konfiqurasiya obyekti
 │   ├── logger.py                # Vaxt damğalı terminal logları
 │   ├── exceptions.py            # Xüsusi xəta tipləri
-│   └── step01_environment.py    # STEP 1: mühit + GPU + konfiqurasiya
+│   ├── step01_environment.py    # STEP 1: mühit + GPU + konfiqurasiya
+│   └── step02_frames.py         # STEP 2: analiz + audio + kadr çıxarılması
 └── tests/
-    └── test_step01_environment.py
+    ├── test_step01_environment.py
+    └── test_step02_frames.py
 ```
 
 ### Testlər

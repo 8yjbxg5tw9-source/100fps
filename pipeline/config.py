@@ -27,6 +27,13 @@ DIR_RAW_FRAMES = "temp_raw_frames"    # Step 2 output: original frames from FFmp
 DIR_INTERPOLATED = "interpolated_720p"  # Step 3 output: e.g. 30fps -> 1000fps frames
 DIR_UPSCALED_8K = "upscaled_8k"       # Step 4 output: 8K frames ready for encode
 
+# Step 2 artefacts (relative to ``workspace_root`` unless stated otherwise).
+AUDIO_FILENAME_WAV = "input_audio.wav"  # lossless extraction (default)
+AUDIO_FILENAME_AAC = "input_audio.aac"  # lossy fallback / explicit choice
+CONFIG_FILENAME = "config.json"         # Step N -> Step N+1 handoff file
+FRAME_PATTERN_PNG = "frame_%06d.png"    # lossless frames (default)
+FRAME_PATTERN_JPG = "frame_%06d.jpg"    # high-quality lossy alternative
+
 
 @dataclass
 class PipelineConfig:
@@ -53,11 +60,30 @@ class PipelineConfig:
     ffmpeg_available: bool = False
     ffmpeg_version: Optional[str] = None
 
+    # -- Source media analysis (filled in by Step 2) ---------------------------
+    source_width: Optional[int] = None
+    source_height: Optional[int] = None
+    original_fps: Optional[float] = None
+    total_frames: Optional[int] = None
+    duration_sec: Optional[float] = None
+    # Multiplier needed to reach target_fps, e.g. 30 -> 1000 = ~33.33x.
+    interpolation_factor: Optional[float] = None
+    estimated_interpolated_frames: Optional[int] = None
+    # -- Step 2 artefacts ------------------------------------------------------
+    has_audio: Optional[bool] = None
+    audio_path: Optional[Path] = None
+    extracted_frame_count: Optional[int] = None
+    frame_pattern: Optional[str] = None
+    # Full probe dump (ffprobe/OpenCV) for Step 3+ debugging.
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         # Accept plain strings for convenience.
         self.input_video_path = Path(self.input_video_path)
         self.final_output_path = Path(self.final_output_path)
         self.workspace_root = Path(self.workspace_root)
+        if self.audio_path is not None:
+            self.audio_path = Path(self.audio_path)
 
         if self.target_fps <= 0:
             raise ValueError(f"target_fps must be positive, got {self.target_fps}")
@@ -114,6 +140,8 @@ class PipelineConfig:
         data = asdict(self)
         for key in ("input_video_path", "final_output_path", "workspace_root"):
             data[key] = str(data[key])
+        if data.get("audio_path") is not None:
+            data["audio_path"] = str(data["audio_path"])
         return data
 
     def save(self, path: str | Path) -> Path:
@@ -150,4 +178,36 @@ class PipelineConfig:
                 else "NOT FOUND"
             ),
         ]
+        # Step 2 section (only once Step 2 has run).
+        if self.original_fps:
+            lines.append(
+                f"  source           : {self.source_width}x{self.source_height} "
+                f"@ {self.original_fps:.2f} FPS, "
+                f"{self.total_frames if self.total_frames is not None else '?'} frames"
+                + (
+                    f", {self.duration_sec:.2f}s"
+                    if self.duration_sec is not None
+                    else ""
+                )
+            )
+            if self.interpolation_factor:
+                lines.append(
+                    f"  interpolation    : {self.interpolation_factor:.2f}x "
+                    f"(-> ~{self.estimated_interpolated_frames} frames @ "
+                    f"{self.target_fps} FPS)"
+                    if self.estimated_interpolated_frames
+                    else f"  interpolation    : {self.interpolation_factor:.2f}x"
+                )
+            lines.append(
+                f"  audio            : "
+                + (str(self.audio_path) if self.has_audio else "none")
+            )
+            lines.append(
+                f"  raw frames       : "
+                + (
+                    f"{self.extracted_frame_count} files ({self.frame_pattern})"
+                    if self.extracted_frame_count is not None
+                    else "not extracted yet"
+                )
+            )
         return "\n".join(lines)

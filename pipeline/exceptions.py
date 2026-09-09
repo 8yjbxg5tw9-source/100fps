@@ -24,3 +24,19 @@ class FFmpegNotFoundError(PipelineError):
 
 class DependencyInstallError(PipelineError):
     """Raised when an automatic ``pip install`` of a missing package fails."""
+
+
+class MetadataProbeError(PipelineError):
+    """Raised when video metadata (FPS, size, ...) cannot be determined.
+
+    This happens when neither FFprobe nor the OpenCV fallback can read the
+    input file (missing tools, corrupt/unsupported container, ...).
+    """
+
+
+class FrameExtractionError(PipelineError):
+    """Raised when FFmpeg frame extraction fails (Step 2, critical path).
+
+    Unlike audio extraction (auxiliary -- Step 8 merges audio only if the
+    file exists), frames are mandatory for Step 3, so any failure aborts.
+    """
